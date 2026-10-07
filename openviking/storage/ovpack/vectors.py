@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import struct
+import sys
 import zipfile
-from collections.abc import Sequence
+from array import array
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from openviking.core.namespace import (
@@ -137,12 +139,13 @@ def read_dense_vectors(
     manifest: dict[str, Any],
     base_name: str,
     index_records: list[dict[str, Any]],
-) -> dict[str, list[float]]:
+) -> dict[str, Sequence[float]]:
     dense_info = manifest_dense_info(manifest)
     if dense_info is None:
         return {}
     data = zf.read(internal_zip_path(base_name, OVPACK_DENSE_PATH))
-    vectors: dict[str, list[float]] = {}
+    vectors: dict[str, Sequence[float]] = {}
+    view = memoryview(data)
     for record in index_records:
         record_id = record.get("record_id")
         dense = record_dense_ref(record)
@@ -150,8 +153,15 @@ def read_dense_vectors(
             continue
         offset = dense["offset"] * 4
         dimensions = dense["dimensions"]
-        values = struct.unpack_from(f"<{dimensions}f", data, offset)
-        vectors[record_id] = [float(value) for value in values]
+        values = array("f")
+        size = dimensions * 4
+        if values.itemsize != 4 or offset < 0 or dimensions < 0 or offset + size > len(data):
+            vectors[record_id] = list(struct.unpack_from(f"<{dimensions}f", data, offset))
+            continue
+        values.frombytes(view[offset : offset + size])
+        if sys.byteorder == "big":
+            values.byteswap()
+        vectors[record_id] = values
     return vectors
 
 
@@ -184,7 +194,7 @@ def _embedding_snapshot_compatible(manifest: dict[str, Any], embedding_cfg) -> t
 async def choose_vector_restore_action(
     manifest: dict[str, Any],
     index_records: list[dict[str, Any]],
-    dense_vectors: dict[str, list[float]],
+    dense_vectors: Mapping[str, Sequence[float]],
     *,
     vector_store,
     vector_config_resolver,
@@ -252,7 +262,7 @@ async def _upsert_vector_snapshot_record(
     vector_store,
     target_uri: str,
     record: dict[str, Any],
-    dense_vector: list[float],
+    dense_vector: Sequence[float],
     ctx: RequestContext,
 ) -> None:
     level = int(record.get("level", 2))
@@ -270,7 +280,7 @@ async def _upsert_vector_snapshot_record(
         "active_count": 0,
         "account_id": ctx.account_id,
         "owner_user_id": owner_fields.get("owner_user_id"),
-        "vector": dense_vector,
+        "vector": dense_vector if isinstance(dense_vector, list) else list(dense_vector),
     }
     if not payload.get("abstract"):
         payload["abstract"] = str(record.get("text") or "")
@@ -287,7 +297,7 @@ async def restore_vector_snapshot(
     vector_store,
     root_uri: str,
     index_records: list[dict[str, Any]],
-    dense_vectors: dict[str, list[float]],
+    dense_vectors: Mapping[str, Sequence[float]],
     manifest_entries: dict[str, dict[str, Any]],
     ctx: RequestContext,
 ) -> None:
