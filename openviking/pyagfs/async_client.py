@@ -363,6 +363,25 @@ class AsyncAGFSClient:
 
     # -- pathlock async wrappers ------------------------------------------------
 
+    async def _acquire_pathlock(
+        self, method_name: str, fs_ctx: Dict[str, str], *args: Any
+    ) -> Dict[str, Any]:
+        lease: Dict[str, Any] | None = None
+
+        async def acquire() -> Dict[str, Any]:
+            nonlocal lease
+            lease = await self.run(method_name, fs_ctx, *args)
+            return lease
+
+        try:
+            return await run_to_completion(acquire)
+        except asyncio.CancelledError:
+            # A native acquisition can succeed after its caller is cancelled.
+            # Settle that lease before cancellation discards the return value.
+            if lease is not None:
+                await run_to_completion(lambda: self.pathlock_release(lease, fs_ctx=fs_ctx))
+            raise
+
     async def pathlock_acquire_exact(
         self,
         path: str,
@@ -372,7 +391,7 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire an exact lock on a single path."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_exact",
             _fs_ctx_or_default(path, fs_ctx),
             path,
@@ -389,7 +408,7 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire exact locks on multiple paths."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_exact_batch",
             _fs_ctx_or_default(paths[0] if paths else "/", fs_ctx),
             paths,
@@ -406,7 +425,7 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire a tree lock on a single path."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_tree",
             _fs_ctx_or_default(path, fs_ctx),
             path,
@@ -423,7 +442,7 @@ class AsyncAGFSClient:
         fs_ctx: Dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         """Acquire tree locks on multiple paths."""
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_tree_batch",
             _fs_ctx_or_default(paths[0] if paths else "/", fs_ctx),
             paths,
@@ -442,7 +461,7 @@ class AsyncAGFSClient:
     ) -> Dict[str, Any]:
         """Acquire a mixed batch of exact and tree locks."""
         first = exact_paths[0] if exact_paths else (tree_paths[0] if tree_paths else "/")
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_exact_tree_batch",
             _fs_ctx_or_default(first, fs_ctx),
             exact_paths,
@@ -469,7 +488,7 @@ class AsyncAGFSClient:
             if request.get("kind") not in {"exact", "tree"}:
                 raise ValueError("pathlock request.kind must be 'exact' or 'tree'")
         first = requests[0]["path"]
-        return await self.run(
+        return await self._acquire_pathlock(
             "pathlock_acquire_batch",
             _fs_ctx_or_default(first, fs_ctx),
             requests,
