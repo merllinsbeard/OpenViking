@@ -14,6 +14,9 @@ import json
 import os
 import re
 import struct
+import sys
+from array import array
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from openviking_cli.exceptions import InvalidArgumentError
@@ -214,7 +217,17 @@ def jsonl_bytes(records: list[dict[str, Any]]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def dense_values_bytes(values: list[float]) -> bytes:
+def dense_values_bytes(values: Sequence[float]) -> bytes:
     if not values:
         return b""
-    return struct.pack(f"<{len(values)}f", *values)
+    if isinstance(values, array) and values.typecode == "f" and values.itemsize == 4:
+        if sys.byteorder == "big":
+            values = array("f", values)
+            values.byteswap()
+        return values.tobytes()
+    # Bound argument expansion while retaining struct's rounding and input errors.
+    return b"".join(
+        struct.pack(f"<{len(chunk)}f", *chunk)
+        for start in range(0, len(values), 4096)
+        for chunk in [values[start : start + 4096]]
+    )
