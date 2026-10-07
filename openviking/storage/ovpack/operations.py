@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import zipfile
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -426,7 +427,7 @@ async def _write_ovpack_archive(
     entries: list[dict[str, Any]],
     manifest: dict[str, Any],
     index_records: list[dict[str, Any]],
-    dense_values: list[float],
+    dense_values: Sequence[float],
     ctx: RequestContext,
     vector_store,
     vector_config_resolver,

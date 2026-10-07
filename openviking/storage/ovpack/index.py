@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import sys
+from array import array
 from typing import Any
 
 from openviking.core.namespace import context_type_for_uri, is_session_uri, owner_fields_for_uri
@@ -12,6 +14,7 @@ from openviking.storage.expr import Eq
 from openviking.storage.ovpack.format import (
     OVPACK_FORMAT_VERSION,
     OVPACK_KIND,
+    dense_values_bytes,
     join_uri,
 )
 from openviking_cli.utils.logger import get_logger
@@ -152,7 +155,7 @@ async def index_records_for_uri(
 
 def append_index_records(
     index_records: list[dict[str, Any]],
-    dense_values: list[float],
+    dense_values: list[float] | array[float],
     rel_path: str,
     kind: str,
     records: list[dict[str, Any]],
@@ -182,7 +185,14 @@ def append_index_records(
                     "dimensions": len(dense),
                 }
             }
-            dense_values.extend(dense)
+            if isinstance(dense_values, array) and dense_values.itemsize == 4:
+                packed = array("f")
+                packed.frombytes(dense_values_bytes(dense))
+                if sys.byteorder == "big":
+                    packed.byteswap()
+                dense_values.extend(packed)
+            else:
+                dense_values.extend(dense)
         index_records.append(item)
 
 
@@ -196,14 +206,16 @@ async def build_manifest(
     package_type: str | None = None,
     scopes: list[str] | None = None,
     include_vectors: bool = False,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[float]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[float] | array[float]]:
     root_user_id = owner_fields_for_uri(root_uri).get("owner_user_id")
     root_entry: dict[str, Any] = {"path": "", "kind": "directory"}
     if root_user_id:
         root_entry["user_id"] = root_user_id
     manifest_entries = [root_entry]
     index_records: list[dict[str, Any]] = []
-    dense_values: list[float] = []
+    dense_values: list[float] | array[float] = array("f")
+    if dense_values.itemsize != 4:
+        dense_values = []
 
     if root_uri != "viking://" and not is_session_uri(root_uri):
         root_records = await index_records_for_uri(
