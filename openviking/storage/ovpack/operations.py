@@ -291,7 +291,7 @@ async def import_ovpack(
     conflict_action = normalize_on_conflict(on_conflict)
     vector_action_mode = normalize_vector_mode(vector_mode)
     index_records: list[dict[str, Any]] = []
-    dense_vectors: dict[str, list[float]] = {}
+    dense_vectors: dict[str, Sequence[float]] = {}
     vector_action = "recompute"
 
     with zipfile.ZipFile(file_path, "r") as zf:
@@ -486,7 +486,22 @@ async def _write_ovpack_archive(
         if dense_snapshot is not None:
             dense_bytes, dense_manifest = dense_snapshot
             manifest["index"]["dense"] = dense_manifest
-            zf.writestr(internal_zip_path(base_name, dense_manifest["path"]), dense_bytes)
+            write_task = asyncio.create_task(
+                asyncio.to_thread(
+                    zf.writestr, internal_zip_path(base_name, dense_manifest["path"]), dense_bytes
+                )
+            )
+            try:
+                await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                # The worker owns the ZIP until it finishes, even after repeated cancellation.
+                while not write_task.done():
+                    try:
+                        await asyncio.shield(write_task)
+                    except asyncio.CancelledError:
+                        continue
+                write_task.result()
+                raise
 
         zf.writestr(
             f"{base_name}/{OVPACK_MANIFEST_ZIP_LEAF}",
@@ -656,7 +671,7 @@ async def restore_ovpack(
     vector_action_mode = normalize_vector_mode(vector_mode)
     root_uri = "viking://"
     index_records: list[dict[str, Any]] = []
-    dense_vectors: dict[str, list[float]] = {}
+    dense_vectors: dict[str, Sequence[float]] = {}
     vector_action = "recompute"
     manifest_entries: dict[str, dict[str, Any]] = {}
     restored_entries: list[dict[str, Any]] = []
