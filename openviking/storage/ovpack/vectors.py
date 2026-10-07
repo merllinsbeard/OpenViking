@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import struct
 import zipfile
+from collections.abc import Sequence
 from typing import Any
 
 from openviking.core.namespace import (
@@ -99,7 +100,7 @@ def embedding_snapshot_metadata(dimensions: int | None, embedding_cfg) -> dict[s
 
 def build_dense_snapshot_manifest(
     index_records: list[dict[str, Any]],
-    dense_values: list[float],
+    dense_values: Sequence[float],
     embedding_cfg,
 ) -> tuple[bytes, dict[str, Any]] | None:
     if not dense_values:
