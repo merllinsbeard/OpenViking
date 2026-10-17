@@ -174,6 +174,7 @@ class _RecallBudget:
     request_timeout: float
     runner: asyncio.Runner = field(default_factory=asyncio.Runner, repr=False)
     client: Any = field(default=None, init=False, repr=False)
+    owner_thread: int = field(default_factory=threading.get_ident, init=False, repr=False)
 
     def remaining(self, timeout: Optional[float] = None) -> float:
         remaining = self.deadline - time.monotonic()
@@ -202,6 +203,11 @@ class _RecallBudget:
 
 
 _recall_budget: ContextVar[Optional[_RecallBudget]] = ContextVar("openviking_recall_budget", default=None)
+
+
+def _current_recall_budget() -> Optional[_RecallBudget]:
+    budget = _recall_budget.get()
+    return budget if budget is not None and budget.owner_thread == threading.get_ident() else None
 
 
 def _gateway_peer_id(platform: str, sender: Any) -> str:
@@ -404,7 +410,7 @@ class _VikingClient:
         )
 
     def _http_request(self, method: str, path: str, *, headers: dict, timeout: float, **kwargs):
-        budget = _recall_budget.get()
+        budget = _current_recall_budget()
         if budget is None:
             return getattr(self._httpx, method)(f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
 
@@ -788,7 +794,7 @@ def _probe_openviking_identity(client: _VikingClient) -> tuple[str, Any]:
         info = client.openapi_payload().get("info")
         verified = isinstance(info, dict) and info.get("title") == "OpenViking API"
     except Exception as exc:
-        if _recall_budget.get() is not None and _is_timeout_error(exc):
+        if _current_recall_budget() is not None and _is_timeout_error(exc):
             raise
         logger.debug("Legacy OpenViking OpenAPI identity probe failed", exc_info=True)
         verified = False
@@ -1262,7 +1268,7 @@ def _classify_runtime_openviking_health(client: _VikingClient, endpoint: str) ->
     except _OpenVikingHTTPError as e:
         return "responded", f"{subject} responded with {_format_openviking_exception(e)}.{_local_listener_suffix(endpoint)}"
     except Exception as exc:
-        if _recall_budget.get() is not None and _is_timeout_error(exc):
+        if _current_recall_budget() is not None and _is_timeout_error(exc):
             raise
     return "unreachable", ""
 
@@ -1819,7 +1825,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """
         if not self._env_refresh_enabled:
             return self._client  # no baseline yet: keep whatever the caller wired up
-        budget = _recall_budget.get()
+        budget = _current_recall_budget()
         acquired = self._client_refresh_lock.acquire(timeout=budget.remaining()) if budget else self._client_refresh_lock.acquire()
         if not acquired:
             raise TimeoutError("OpenViking client refresh budget exhausted")
@@ -2007,7 +2013,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _remaining_recall_timeout(deadline: float, per_request_timeout: float) -> float:
-        budget = _recall_budget.get()
+        budget = _current_recall_budget()
         if budget is not None:
             deadline = min(deadline, budget.deadline)
         remaining = deadline - time.monotonic()

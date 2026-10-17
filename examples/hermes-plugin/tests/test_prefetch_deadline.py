@@ -150,3 +150,26 @@ def test_identity_retry_and_refresh_lock_cannot_restart_budget(external_provider
         finally:
             if refresh:
                 provider._client_refresh_lock.release()
+
+
+def test_native_background_worker_does_not_inherit_recall_transport(external_provider):
+    from agent.memory_provider import spawn_context_thread
+
+    def respond(handler):
+        send(handler, {"content": "The captured source remains available."}, delay=0.2)
+
+    with recall_server(respond) as endpoint:
+        provider, module, _ = configure(external_provider, endpoint)
+        budget = module._RecallBudget(time.monotonic() + 0.1, 0.05)
+        token = module._recall_budget.set(budget)
+        result = []
+        worker = spawn_context_thread(
+            lambda: result.append(provider._client.get("/api/v1/content/read")), name="capture-check"
+        )
+        try:
+            worker.start()
+        finally:
+            module._recall_budget.reset(token)
+            budget.close()
+        worker.join(1)
+        assert result == [{"result": {"content": "The captured source remains available."}}]
