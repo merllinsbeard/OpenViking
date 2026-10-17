@@ -122,27 +122,82 @@ async def test_stale_revision_rejects_entire_preflight_before_any_write(native_t
     assert await fs.read_file(stale, ctx=ctx) == "newer"
 
 
-async def test_missing_target_with_expected_revision_is_preserved(native_target):
+@pytest.mark.parametrize("skip_conflicts", [False, True])
+@pytest.mark.parametrize("filename", ["missing.md", ".abstract.md", ".overview.md"])
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("replace", None),
+        ("replace", digest("old")),
+        ("append", None),
+        ("append", digest("old")),
+        ("upsert", digest("old")),
+    ],
+)
+async def test_missing_target_conflicts_preserve_absence_and_allow_compatible_writes(
+    native_target, skip_conflicts, filename, mode, expected
+):
     fs, ctx, _ = native_target
-    uri = ROOT + "/missing.md"
-    result = await write(
-        native_target,
-        [
-            {
-                "uri": uri,
-                "content": "resurrected",
-                "mode": "upsert",
-                "expected_sha256": digest("old"),
-            }
-        ],
-        skip_conflicts=True,
-    )
-    assert result["conflicts"][0]["code"] == "CONFLICT"
+    uri = ROOT + "/" + filename
+    compatible = ROOT + "/compatible.md"
+    operations = [
+        {"uri": compatible, "content": "compatible bytes", "mode": "create"},
+        {"uri": uri, "content": "resurrected", "mode": mode, "expected_sha256": expected},
+    ]
+    error_type = ConflictError if mode == "upsert" else NotFoundError
+    if skip_conflicts:
+        result = await write(native_target, operations, skip_conflicts=True)
+        assert result["created"] == [compatible]
+        assert result["updated"] == []
+        assert result["conflicts"][0]["uri"] == uri
+        assert result["conflicts"][0]["code"] == ("CONFLICT" if mode == "upsert" else "NOT_FOUND")
+        assert len(result["conflicts"]) == 1
+        assert await fs.read_file(compatible, ctx=ctx) == "compatible bytes"
+    else:
+        with pytest.raises(error_type):
+            await write(native_target, operations, skip_conflicts=False)
+        with pytest.raises(NotFoundError):
+            await fs.read_file(compatible, ctx=ctx)
     with pytest.raises(NotFoundError):
         await fs.read_file(uri, ctx=ctx)
-    created = await write(native_target, [{"uri": uri, "content": "fresh", "mode": "create"}])
-    assert created["created"] == [uri]
-    assert await fs.read_file(uri, ctx=ctx) == "fresh"
+    queue = queue_module.get_queue_manager()
+    assert await queue.size(queue.EMBEDDING) == int(skip_conflicts)
+    assert await queue.size(queue.SEMANTIC) == 0
+    if skip_conflicts:
+        message = await queue.get_queue(queue.EMBEDDING).peek()
+        assert message.context_data["uri"] == compatible
+        assert message.payload.message == "compatible bytes"
+
+
+@pytest.mark.parametrize("skip_conflicts", [False, True])
+@pytest.mark.parametrize("filename", [".abstract.md", ".overview.md"])
+@pytest.mark.parametrize("mode", ["create", "upsert"])
+async def test_generated_sidecar_creation_is_forbidden_even_with_skip_conflicts(
+    native_target, skip_conflicts, filename, mode
+):
+    fs, ctx, _ = native_target
+    uri = ROOT + "/" + filename
+    compatible = ROOT + "/compatible.md"
+    with pytest.raises(InvalidArgumentError, match="cannot create generated"):
+        await write(
+            native_target,
+            [
+                {"uri": compatible, "content": "compatible bytes", "mode": "create"},
+                {"uri": uri, "content": "forbidden", "mode": mode},
+            ],
+            skip_conflicts=skip_conflicts,
+        )
+    for target_uri in (uri, compatible):
+        with pytest.raises(NotFoundError):
+            await fs.read_file(target_uri, ctx=ctx)
+    queue = queue_module.get_queue_manager()
+    assert await queue.size(queue.EMBEDDING) == 0
+    assert await queue.size(queue.SEMANTIC) == 0
+    result = await write(
+        native_target, [{"uri": compatible, "content": "valid bytes", "mode": "create"}]
+    )
+    assert result["created"] == [compatible]
+    assert await fs.read_file(compatible, ctx=ctx) == "valid bytes"
 
 
 async def test_parallel_writers_cannot_both_replace_the_same_revision(native_target):

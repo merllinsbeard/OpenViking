@@ -1,4 +1,5 @@
 import base64
+import hashlib
 
 import pytest
 
@@ -11,6 +12,7 @@ from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAc
 from openviking.utils.content_hash import content_md5
 from openviking_cli.exceptions import (
     AlreadyExistsError,
+    ConflictError,
     InvalidArgumentError,
     NotFoundError,
     OpenVikingError,
@@ -405,10 +407,10 @@ async def test_batch_partial_failure_refreshes_successful_files_and_retry_is_saf
 
 
 @pytest.mark.asyncio
-async def test_batch_refresh_failure_retry_rewrites_and_refreshes(monkeypatch):
+async def test_batch_refresh_failure_requires_reconciliation_and_explicit_repair(monkeypatch):
     root = "viking://resources/wiki"
     page = f"{root}/page.md"
-    vfs = _VFS(root)
+    vfs = _VFS(root, {page: "before"})
     coordinator = ContentWriteCoordinator(vfs)
     calls = []
 
@@ -423,7 +425,8 @@ async def test_batch_refresh_failure_retry_rewrites_and_refreshes(monkeypatch):
         {
             "uri": page,
             "content": "landed",
-            "mode": "upsert",
+            "mode": "replace",
+            "expected_sha256": hashlib.sha256(b"before").hexdigest(),
         }
     ]
 
@@ -431,17 +434,37 @@ async def test_batch_refresh_failure_retry_rewrites_and_refreshes(monkeypatch):
         await coordinator.batch_write(root_uri=root, operations=operations, ctx=ctx, wait=False)
     assert error.value.code == "REFRESH_FAILED"
     assert "injected refresh failure" in str(error.value)
-    assert "Re-run the same batch-write or ov compile command" in str(error.value)
-    assert error.value.details["created"] == [page]
-    assert vfs.files[page] == "landed"
+    assert "Reconcile each exact target first" in str(error.value)
+    assert "current expected_sha256 with skip_conflicts=false" in str(error.value)
+    assert "reindex" in str(error.value)
+    assert "mode=semantic_and_vectors and force=true" in str(error.value)
+    assert error.value.details["updated"] == [page]
+    current = await vfs.read_file_bytes(page, ctx=ctx)
+    assert current == b"landed"
     assert vfs.writes == [page]
 
+    with pytest.raises(ConflictError):
+        await coordinator.batch_write(root_uri=root, operations=operations, ctx=ctx, wait=False)
+    repair = [{**operations[0], "expected_sha256": hashlib.sha256(current).hexdigest()}]
+    skipped = await coordinator.batch_write(
+        root_uri=root, operations=repair, ctx=ctx, wait=False, skip_conflicts=True
+    )
+    assert skipped["unchanged"] == [page]
+    assert vfs.writes == [page]
+    assert calls == [{page: "modified"}]
+
     result = await coordinator.batch_write(
-        root_uri=root, operations=operations, ctx=ctx, wait=False
+        root_uri=root,
+        operations=repair,
+        ctx=ctx,
+        wait=False,
+        skip_conflicts=False,
+        processing_mode="semantic_and_vectors",
     )
     assert result["updated"] == [page]
+    assert await vfs.read_file_bytes(page, ctx=ctx) == b"landed"
     assert vfs.writes == [page, page]
-    assert calls == [{page: "added"}, {page: "modified"}]
+    assert calls == [{page: "modified"}, {page: "modified"}]
 
 
 @pytest.mark.asyncio
