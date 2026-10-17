@@ -255,6 +255,10 @@ A single directory import can preserve a mixed native Markdown layout:
 
 With `preserve_structure=true`, `journal/day.md` produces `journal/day.md`, while a small `docs/guide.md` produces `docs/guide/guide.md`. Frontmatter titles and local images still affect names and layout through the normal Markdown parser. Supported inline Markdown links use the target file's mode, including anchors into split sections. Reference-style links remain unchanged. Missing targets retain their original links. Existing exact-name collisions can overwrite an earlier output; case-only collisions in the local artifact store appear in `meta.failed_files`. Inspect failures before accepting a snapshot. These existing limitations also apply to imports with overrides. Omitting the option preserves the existing parser behavior.
 
+Overrides apply to files in the current materialized directory. A Feishu URL-only entry selected for native `no_split` parsing must have local content. Otherwise, parsing raises an argument error before creating an output artifact. The option does not download or convert remote documents. Archive-qualified prefixes such as `bundle.zip/journal` do not apply inside ZIP files. Recursive archive imports retain their existing layout.
+
+An override from global `no_split` to `default` enables Understanding directory limits only when a selected file actually routes to Understanding. Unused prefixes and native-only files do not enable those limits. Actual Understanding jobs retain the existing scan limits and source filters.
+
 #### 3. Usage Examples
 
 These examples use the default asynchronous mode without waiting parameters. Save the returned `task_id` and query the [Task API](17-tasks.md). Read summaries or search the imported content only after the task reaches `completed`.

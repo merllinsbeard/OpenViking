@@ -32,7 +32,7 @@ from openviking.parse.base import (
 )
 from openviking.parse.gitignore import GitignoreMatcher
 from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME
-from openviking.parse.mode import ParseMode, PathParsePolicy
+from openviking.parse.mode import PathParsePolicy
 from openviking.parse.output import (
     ParseArtifactWriter,
     copy_artifact_tree,
@@ -200,13 +200,7 @@ class DirectoryParser(BaseParser):
             backend = normalize_parser_backend(kwargs.get("parser_backend")) if plan else None
             parser_api_config = getattr(ov_config, "parser_api", None)
             understanding_limits_enabled = bool(
-                (
-                    split_content
-                    or (
-                        path_policy
-                        and any(mode is ParseMode.DEFAULT for _, mode in path_policy.overrides)
-                    )
-                )
+                split_content
                 and backend is not ParserBackend.INTERNAL
                 and (
                     (plan and plan.use_understanding)
@@ -218,14 +212,17 @@ class DirectoryParser(BaseParser):
                 )
             )
 
+            scan_options = {
+                "root": str(source_path),
+                "registry": registry,
+                "strict": kwargs.get("strict", False),
+                "ignore_dirs": kwargs.get("ignore_dirs"),
+                "include": kwargs.get("include"),
+                "exclude": kwargs.get("exclude"),
+                "additional_can_process": parser_router.should_use_understanding_api,
+            }
             scan_result = scan_directory(
-                root=str(source_path),
-                registry=registry,
-                strict=kwargs.get("strict", False),
-                ignore_dirs=kwargs.get("ignore_dirs"),
-                include=kwargs.get("include"),
-                exclude=kwargs.get("exclude"),
-                additional_can_process=parser_router.should_use_understanding_api,
+                **scan_options,
                 max_files=directory_config.max_files
                 if plan or understanding_limits_enabled
                 else None,
@@ -289,6 +286,11 @@ class DirectoryParser(BaseParser):
                     )
                 )
                 use_understanding = bool(file_split_content and configured_for_understanding)
+                if remote and not file_split_content and not cf.path.is_file():
+                    raise InvalidArgumentError(
+                        "parse_mode='no_split' requires materialized Feishu content for native "
+                        f"parsing: {cf.rel_path}"
+                    )
                 native_parser = None if use_understanding else self._assign_parser(cf, registry)
                 file_parser = parser_router if use_understanding else native_parser
                 native_parser_unavailable = bool(
@@ -351,6 +353,13 @@ class DirectoryParser(BaseParser):
                 file_jobs.append(job)
                 if use_understanding:
                     understanding_jobs.append(job)
+
+            if path_policy and understanding_jobs and not understanding_limits_enabled:
+                scan_directory(
+                    **scan_options,
+                    max_files=directory_config.max_files,
+                    max_depth=directory_config.max_depth,
+                )
 
             viking_fs = self._get_viking_fs() if output_store is None else None
             writer = await create_parse_artifact_writer(output_store, viking_fs=viking_fs)
