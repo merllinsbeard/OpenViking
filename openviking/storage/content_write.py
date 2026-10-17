@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import os
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -57,6 +58,7 @@ from openviking.utils.path_safety import (
 from openviking.utils.tags import normalize_search_tags
 from openviking_cli.exceptions import (
     AlreadyExistsError,
+    ConflictError,
     DeadlineExceededError,
     InvalidArgumentError,
     NotFoundError,
@@ -225,6 +227,8 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         wait: bool = True,
         timeout: Optional[float] = None,
+        skip_conflicts: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         """Write a bundle under one directory, then refresh it as a batch.
 
@@ -232,8 +236,13 @@ class ContentWriteCoordinator:
         ``upsert`` is available for callers that already hold the desired final tree.
         All target files stay locked from state validation through the last write,
         while unrelated files remain writable. Refresh starts after the locks are released.
+        An optional expected_sha256 checks the existing raw bytes under these locks.
+        With skip_conflicts, changed, missing or occupied targets are returned in
+        conflicts and preserved while compatible files commit. I/O and refresh failures
+        remain errors and can leave earlier writes visible.
         """
         normalized_root = self._validate_uri_path(root_uri, field_name="root_uri")
+        processing_mode = normalize_processing_mode(processing_mode)
         await self._validate_batch_root(normalized_root, ctx=ctx)
         normalized_operations = await self._normalize_batch_operations(
             normalized_root, operations, ctx=ctx
@@ -256,9 +265,11 @@ class ContentWriteCoordinator:
         unchanged: list[str] = []
         refresh_kinds: dict[str, str] = {}
         file_md5s: dict[str, str] = {}
+        file_contents: dict[str, bytes] = {}
         file_abstracts: dict[str, str] = {}
         sidecar_directories: set[str] = set()
         pending: list[tuple[dict[str, Any], bool, str]] = []
+        conflicts: list[dict[str, str]] = []
         write_error: Exception | None = None
         lock_released = False
         try:
@@ -266,7 +277,7 @@ class ContentWriteCoordinator:
                 uri = operation["uri"]
                 stat = await self._safe_stat(uri, ctx=ctx, allow_not_found=True)
                 exists = not stat.get("not_found")
-                if exists and stat.get("isDir"):
+                if exists and stat.get("isDir") and not skip_conflicts:
                     raise InvalidArgumentError(f"batch-write target must be a file: {uri}")
 
                 requested_mode = operation["mode"]
@@ -279,21 +290,46 @@ class ContentWriteCoordinator:
                         raise InvalidArgumentError(
                             f"cannot create generated abstract overview directly: {uri}"
                         )
-                if write_mode == "create" and exists:
-                    raise AlreadyExistsError(uri, "file")
-                if write_mode in {"replace", "append"} and not exists:
-                    raise NotFoundError(uri, "file")
+                try:
+                    if exists and stat.get("isDir"):
+                        raise ConflictError(f"Target is a directory: {uri}")
+                    if write_mode == "create" and exists:
+                        raise AlreadyExistsError(uri, "file")
+                    if write_mode in {"replace", "append"} and not exists:
+                        raise NotFoundError(uri, "file")
+                    expected = operation.get("expected_sha256")
+                    if expected is not None:
+                        if not exists:
+                            raise ConflictError(f"Expected content no longer exists: {uri}")
+                        current = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
+                        if hashlib.sha256(current).hexdigest() != expected:
+                            raise ConflictError(f"Content revision changed: {uri}")
+                        desired = operation["content"]
+                        if isinstance(desired, str):
+                            desired = desired.encode("utf-8")
+                        if skip_conflicts and write_mode == "replace" and current == desired:
+                            unchanged.append(uri)
+                            continue
+                except (AlreadyExistsError, NotFoundError, ConflictError) as exc:
+                    if not skip_conflicts:
+                        raise
+                    conflicts.append({"uri": uri, "code": exc.code, "message": str(exc)})
+                    continue
                 pending.append((operation, exists, write_mode))
 
-            file_abstracts = await self._load_file_abstracts(
-                [
-                    operation["uri"]
-                    for operation, existed, _ in pending
-                    if existed
-                    and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
-                    and not is_abstract_overview_uri(operation["uri"])
-                ],
-                ctx=ctx,
+            file_abstracts = (
+                await self._load_file_abstracts(
+                    [
+                        operation["uri"]
+                        for operation, existed, _ in pending
+                        if existed
+                        and context_type_for_uri(operation["uri"]) in {"resource", "skill"}
+                        and not is_abstract_overview_uri(operation["uri"])
+                    ],
+                    ctx=ctx,
+                )
+                if processing_mode != VECTORS_ONLY
+                else {}
             )
 
             for operation, existed, write_mode in pending:
@@ -311,6 +347,8 @@ class ContentWriteCoordinator:
                         "skill",
                     } and not is_abstract_overview_uri(uri):
                         file_md5s[uri] = content_md5(final_content)
+                        if processing_mode == VECTORS_ONLY:
+                            file_contents[uri] = final_content
                 except Exception as exc:
                     write_error = exc
                     break
@@ -352,6 +390,8 @@ class ContentWriteCoordinator:
                             telemetry_id=telemetry_id,
                             file_md5s=file_md5s,
                             file_abstracts=file_abstracts,
+                            processing_mode=processing_mode,
+                            file_contents=file_contents,
                         )
                         if refresh_kinds
                         else (
@@ -379,9 +419,11 @@ class ContentWriteCoordinator:
                             raise
                         cause = str(exc).strip() or type(exc).__name__
                         raise OpenVikingError(
-                            "Content is already at the requested state, but semantic/index "
-                            f"refresh failed: {cause}. Re-run the same batch-write or ov compile "
-                            "command to rewrite the final state and retry the refresh.",
+                            "Content effects may already be visible, but semantic/index "
+                            f"refresh failed: {cause}. Reconcile each exact target first. "
+                            "To retry refresh, replace the reconciled final content using its "
+                            "current expected_sha256 with skip_conflicts=false, or reindex "
+                            "the affected directory with mode=semantic_and_vectors and force=true.",
                             code="REFRESH_FAILED",
                             details={
                                 "root_uri": normalized_root,
@@ -406,6 +448,8 @@ class ContentWriteCoordinator:
             "unchanged": unchanged,
             "queue_status": queue_status,
         }
+        if skip_conflicts:
+            result["conflicts"] = conflicts
         if refresh_outcome is not None:
             semantic_status, vector_status = refresh_outcome.statuses(wait=wait)
             result["semantic_status"] = semantic_status
@@ -513,6 +557,13 @@ class ContentWriteCoordinator:
                 raise ResourceExhaustedError("batch-write total content exceeds size limit")
 
             mode = raw.get("mode", "replace")
+            expected = raw.get("expected_sha256")
+            if expected is not None and (
+                not isinstance(expected, str)
+                or len(expected) != 64
+                or any(c not in "0123456789abcdef" for c in expected)
+            ):
+                raise InvalidArgumentError("expected_sha256 must be a lowercase SHA-256 digest")
             self._validate_batch_mode(mode)
             if has_content_base64 and mode == "append":
                 raise InvalidArgumentError(
@@ -527,6 +578,7 @@ class ContentWriteCoordinator:
                     "uri": uri,
                     "content": content,
                     "mode": mode,
+                    "expected_sha256": expected,
                 }
             )
         return sorted(normalized, key=lambda operation: operation["uri"])
@@ -541,16 +593,29 @@ class ContentWriteCoordinator:
         telemetry_id: str,
         file_md5s: dict[str, str] | None = None,
         file_abstracts: dict[str, str] | None = None,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        file_contents: dict[str, bytes] | None = None,
     ) -> _BatchRefreshOutcome:
         resource_groups: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(
             lambda: {"added": [], "modified": []}
         )
         memory_groups: dict[str, list[str]] = defaultdict(list)
+        embedding_requested = False
         for uri, change_type in sorted(refresh_kinds.items()):
             context_type = context_type_for_uri(uri)
             if context_type == "memory":
                 parent = VikingURI(uri).parent
                 memory_groups[parent.uri if parent is not None else uri].append(uri)
+                continue
+            if processing_mode == VECTORS_ONLY:
+                requested = await self._vectorize_written_file(
+                    uri=uri,
+                    context_type=context_type,
+                    ctx=ctx,
+                    file_md5=(file_md5s or {}).get(uri),
+                    file_content=(file_contents or {}).get(uri),
+                )
+                embedding_requested = embedding_requested or requested
                 continue
             refresh_root = await self._resolve_root_uri(uri, ctx=ctx, anchor_to_parent=True)
             resource_groups[(refresh_root, context_type)][change_type].append(uri)
@@ -578,7 +643,6 @@ class ContentWriteCoordinator:
             )
             semantic_actions.append(action)
 
-        embedding_requested = False
         for directory_uri, uris in sorted(memory_groups.items()):
             await MemoryUpdater.refresh_schema_overview(
                 viking_fs=self._viking_fs,
@@ -1031,6 +1095,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
         file_md5: str | None = None,
+        file_content: bytes | None = None,
     ) -> bool:
         parent = VikingURI(uri).parent
         if parent is None:
@@ -1044,6 +1109,8 @@ class ContentWriteCoordinator:
             ctx=ctx,
             ingest_options=ingest_options,
             file_md5=file_md5,
+            file_content=file_content,
+            materialize_content=file_content is not None,
         )
 
     async def _vectorize_abstract_overview(

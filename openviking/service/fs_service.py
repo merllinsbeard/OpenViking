@@ -24,6 +24,7 @@ from openviking.privacy import (
     get_skill_name_from_uri,
     restore_skill_content,
 )
+from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
@@ -1259,6 +1260,8 @@ class FSService:
         ctx: RequestContext,
         wait: bool = True,
         timeout: Optional[float] = None,
+        skip_conflicts: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         """Apply multiple file writes and aggregate downstream refresh."""
         viking_fs = self._ensure_initialized()
@@ -1269,6 +1272,8 @@ class FSService:
             ctx=ctx,
             wait=wait,
             timeout=timeout,
+            skip_conflicts=skip_conflicts,
+            processing_mode=processing_mode,
         )
 
     async def set_tags(

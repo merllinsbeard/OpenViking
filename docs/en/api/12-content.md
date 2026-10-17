@@ -347,6 +347,8 @@ Write multiple files below one Resource or Memory directory, then refresh the af
 | `wait` | boolean | No | `true` | Wait for semantic/vector refresh |
 | `timeout` | number | No | `null` | Refresh timeout in seconds when `wait=true` |
 | `telemetry` | boolean/object | No | `false` | Include operation telemetry |
+| `skip_conflicts` | boolean | No | `false` | Preserve conflicting targets and return their URI, error code, and message while applying compatible operations |
+| `processing_mode` | string | No | `semantic_and_vectors` | `semantic_and_vectors` or `vectors_only` for the whole batch |
 
 Each operation contains:
 
@@ -356,16 +358,27 @@ Each operation contains:
 | `content` | string | Conditional | UTF-8 text; exactly one of `content` and `content_base64` is required |
 | `content_base64` | string | Conditional | Base64-encoded bytes; not supported for Memory targets |
 | `mode` | string | No | `replace` (default), `append`, `create`, or `upsert` |
+| `expected_sha256` | string | No | Lowercase SHA-256 of the existing raw file bytes, checked under the target locks before any writes |
 
 **Notes**
 
 - A request supports at most 256 operations, 8 MiB per file, and 16 MiB total.
 - All targets must be files below `root_uri`, use the same context type, and have unique canonical URIs.
 - Resource targets may use any safe file extension; Memory targets retain the text extension allowlist and do not accept binary content.
-- `replace`, `append`, and `create` match `write()` semantics. `upsert` replaces an existing file or creates a missing file.
+- `create` requires a missing target. `replace` and `append` require an existing target. `upsert` replaces an existing file or creates a missing file. These batch preconditions are stricter than single `write()` materialization.
+- For read-modify-replace, read the complete raw content and send its `expected_sha256`. For a new file, use `create` without an expected hash. A hash always requires an existing file, including with `upsert`.
+- Memory serialization can add `MEMORY_FIELDS`, and sidecar writes preserve OKF metadata. Their final stored bytes can differ from the supplied body. Hash the complete stored representation and reconcile the intended serialized result rather than assuming the request body is the raw result.
+- These optional preconditions protect participating batch writers. Single writes, raw storage, imports, moves, and other writers do not acquire a caller revision contract automatically.
+- If `skip_conflicts=true`, the result adds a `conflicts` array. Matching-revision replacements with identical desired bytes appear in `unchanged` and do not retry refresh. A stale hash remains a conflict even if the desired bytes were already written.
+- After a lost response or partial error, reconcile each exact destination against the complete desired bytes before retrying. Append replay can duplicate content. To retry failed refresh after reconciliation, use the current raw hash and `skip_conflicts=false` to rewrite the final state.
+- To rebuild derived semantics, use the reconciled final content with `mode=replace` and `processing_mode=semantic_and_vectors`, or call `POST /api/v1/content/reindex` with `mode=semantic_and_vectors` and `force=true`. Shared Resource reindex requires an admin identity. Check the resulting summaries and vectors before completing the effect.
+- For Resource files, `vectors_only` queues file embeddings without regenerating parent L0/L1. Existing abstracts and overviews can remain stale. Memory refresh behavior is unchanged. Content read-back, completed embeddings, and current derived summaries require separate checks.
+- `vectors_only` messages capture the bytes written by that operation. Later writes can still enqueue or finish before older derived work. Check the current source revision against the indexed `md5` and reconcile stale derived results after competing work settles.
 - The batch acquires exact locks for all target files before validating file state and writing. Writes to disjoint files in the same directory can proceed concurrently; overlapping writes and parent-directory deletion or moves still conflict. Semantic processing starts after all writes finish and the locks are released, refreshing the affected `.overview.md` and `.abstract.md` files together.
 - Resource parent refreshes use the same best-effort behavior as `write()`: L0/L1 lock conflicts skip the directory refresh and its vector updates while preserving file writes and file processing. A later refresh is not guaranteed.
 - An underlying I/O failure can still leave writes completed earlier in the batch visible.
+- Preflight is not a transaction across file I/O and downstream refresh. `REFRESH_FAILED` means content effects may already be visible. Exact batch URIs retain spaces. Use URL-encoded full raw read-back for those targets.
+- Python SDK versions without typed batch processing options can use the existing `options={"extra": {"processing_mode": "vectors_only", "skip_conflicts": True}}` extension. Supply `expected_sha256` in each operation.
 - Existing `.abstract.md` and `.overview.md` bodies may be replaced or appended. OpenViking preserves and validates protected OKF metadata and rebuilds only the directory's existing L0/L1 vectors for these operations.
 - In the response body, `semantic_status` (`queued`, `complete`, `deferred`, or `skipped`) reports the directory aggregation status; it is `skipped` if any directory encounters contention before enqueueing. Meanwhile, `vector_status` reports vector maintenance for changed files.
 
