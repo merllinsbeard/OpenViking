@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from openviking.parse.accessors.mime_types import IANA_MEDIA_TYPE_TO_EXTENSION
 from openviking.parse.base import NodeType, ParseResult, ResourceNode, create_parse_result
 from openviking.parse.image_validation import is_valid_image
+from openviking.parse.mode import PathParsePolicy
 from openviking.parse.output import (
     AgfsParseOutputStore,
     ParseArtifactRef,
@@ -153,6 +154,7 @@ class _RewriteContext:
     split_content: bool
     adaptive_flatten_requested: bool
     flatten_single_output: bool
+    path_policy: Optional[PathParsePolicy] = None
     split_cache: Dict[Tuple[str, bool, bool], Optional[Dict[str, str]]] = field(
         default_factory=dict
     )
@@ -339,6 +341,7 @@ class MarkdownParser(BaseParser):
                     split_content=split_content,
                     adaptive_flatten_requested=adaptive_flatten_requested,
                     flatten_single_output=flatten_single_output,
+                    path_policy=kwargs.get("_path_parse_policy"),
                 )
 
             # Phase 2 — write only: replay the plan against the real VikingFS,
@@ -1297,6 +1300,10 @@ class MarkdownParser(BaseParser):
         side-effect-free parse, cached per parse_content() call. None on parse failure."""
         split_content = rewrite_ctx.split_content
         flatten_single_output = rewrite_ctx.adaptive_flatten_requested
+        if rewrite_ctx.path_policy is not None:
+            relative_path = Path(target_path).relative_to(rewrite_ctx.import_root).as_posix()
+            split_content = rewrite_ctx.path_policy.split_content(relative_path)
+            flatten_single_output = not split_content
         key = (os.path.abspath(target_path), split_content, flatten_single_output)
         if key not in rewrite_ctx.split_cache:
             rewrite_ctx.split_cache[key] = await self._probe_split_layout(

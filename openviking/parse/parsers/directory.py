@@ -32,6 +32,7 @@ from openviking.parse.base import (
 )
 from openviking.parse.gitignore import GitignoreMatcher
 from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME
+from openviking.parse.mode import PathParsePolicy
 from openviking.parse.output import (
     ParseArtifactWriter,
     copy_artifact_tree,
@@ -146,6 +147,14 @@ class DirectoryParser(BaseParser):
         if not source_path.is_dir():
             raise NotADirectoryError(f"Not a directory: {source_path}")
 
+        path_policy = (
+            PathParsePolicy.from_options(
+                kwargs.get("split_content", True), kwargs["parse_mode_overrides"]
+            )
+            if "parse_mode_overrides" in kwargs
+            else None
+        )
+
         # Check if this is a git repository, delegate to CodeRepositoryParser
         if await self._is_git_repository(source_path):
             logger.debug(
@@ -203,14 +212,17 @@ class DirectoryParser(BaseParser):
                 )
             )
 
+            scan_options = {
+                "root": str(source_path),
+                "registry": registry,
+                "strict": kwargs.get("strict", False),
+                "ignore_dirs": kwargs.get("ignore_dirs"),
+                "include": kwargs.get("include"),
+                "exclude": kwargs.get("exclude"),
+                "additional_can_process": parser_router.should_use_understanding_api,
+            }
             scan_result = scan_directory(
-                root=str(source_path),
-                registry=registry,
-                strict=kwargs.get("strict", False),
-                ignore_dirs=kwargs.get("ignore_dirs"),
-                include=kwargs.get("include"),
-                exclude=kwargs.get("exclude"),
-                additional_can_process=parser_router.should_use_understanding_api,
+                **scan_options,
                 max_files=directory_config.max_files
                 if plan or understanding_limits_enabled
                 else None,
@@ -258,6 +270,9 @@ class DirectoryParser(BaseParser):
             file_jobs: List[Dict[str, Any]] = []
             understanding_jobs: List[Dict[str, Any]] = []
             for index, cf in enumerate(processable_files):
+                file_split_content = (
+                    path_policy.split_content(cf.rel_path) if path_policy else split_content
+                )
                 entry = entry_map.get(cf.path)
                 remote = entry is not None and entry.kind == "url"
                 normalized = entry is not None and entry.kind == "markdown"
@@ -270,11 +285,16 @@ class DirectoryParser(BaseParser):
                         or parser_router.should_use_understanding_api(cf.path)
                     )
                 )
-                use_understanding = bool(split_content and configured_for_understanding)
+                use_understanding = bool(file_split_content and configured_for_understanding)
+                if remote and not file_split_content and not cf.path.is_file():
+                    raise InvalidArgumentError(
+                        "parse_mode='no_split' requires materialized Feishu content for native "
+                        f"parsing: {cf.rel_path}"
+                    )
                 native_parser = None if use_understanding else self._assign_parser(cf, registry)
                 file_parser = parser_router if use_understanding else native_parser
                 native_parser_unavailable = bool(
-                    not split_content and native_parser is None and not is_text_file(cf.path)
+                    not file_split_content and native_parser is None and not is_text_file(cf.path)
                 )
                 parser_name = (
                     "UnderstandingAPI"
@@ -293,6 +313,7 @@ class DirectoryParser(BaseParser):
                 }
                 is_media_file = Path(cf.path).suffix.lower() in MEDIA_EXTENSIONS
                 job = {
+                    "split_content": file_split_content,
                     "index": index,
                     "classified_file": cf,
                     "file_parser": file_parser,
@@ -332,6 +353,13 @@ class DirectoryParser(BaseParser):
                 file_jobs.append(job)
                 if use_understanding:
                     understanding_jobs.append(job)
+
+            if path_policy and understanding_jobs and not understanding_limits_enabled:
+                scan_directory(
+                    **scan_options,
+                    max_files=directory_config.max_files,
+                    max_depth=directory_config.max_depth,
+                )
 
             viking_fs = self._get_viking_fs() if output_store is None else None
             writer = await create_parse_artifact_writer(output_store, viking_fs=viking_fs)
@@ -392,6 +420,7 @@ class DirectoryParser(BaseParser):
                     max_concurrent=directory_config.max_concurrent,
                     job_timeout=job_timeout,
                     output_store=output_store,
+                    path_policy=path_policy,
                 )
                 pending_results.extend(
                     parsed["result"]
@@ -429,7 +458,7 @@ class DirectoryParser(BaseParser):
                                 viking_fs,
                                 target_writer=writer,
                                 preserve_structure=preserve_structure,
-                                split_content=split_content,
+                                split_content=job["split_content"],
                             )
                             detail = {
                                 "ok": True,
@@ -471,7 +500,8 @@ class DirectoryParser(BaseParser):
                         output_store=output_store,
                         preserve_structure=preserve_structure,
                         import_root=str(source_path),
-                        split_content=split_content,
+                        split_content=job["split_content"],
+                        path_policy=path_policy,
                     )
 
                 file_entry = self._file_status_entry(cf, parser_name, detail)
@@ -794,6 +824,7 @@ class DirectoryParser(BaseParser):
         max_concurrent: int,
         job_timeout: float,
         output_store: Any = None,
+        path_policy: Optional[PathParsePolicy] = None,
     ) -> Dict[int, Dict[str, Any]]:
         """Parse jobs with a fixed local pool and a shared service-loop limit."""
         limiter = _get_understanding_limiter(max_concurrent)
@@ -817,7 +848,8 @@ class DirectoryParser(BaseParser):
                             job["file_parser"],
                             preserve_structure=preserve_structure,
                             import_root=import_root,
-                            split_content=split_content,
+                            split_content=job.get("split_content", split_content),
+                            path_policy=path_policy,
                             parse_options=job.get("parse_options"),
                             output_store=output_store,
                         )
@@ -857,9 +889,12 @@ class DirectoryParser(BaseParser):
         split_content: bool,
         parse_options: Optional[Dict[str, Any]] = None,
         output_store: Any = None,
+        path_policy: Optional[PathParsePolicy] = None,
     ) -> ParseResult:
         """Run one parser without mutating the directory destination tree."""
         options = dict(parse_options or {})
+        if path_policy is not None:
+            options["_path_parse_policy"] = path_policy
         if output_store is not None:
             options["parse_output_store"] = output_store
         source = options.pop("_source", str(classified_file.path))
@@ -955,6 +990,7 @@ class DirectoryParser(BaseParser):
         preserve_structure: bool = True,
         import_root: Optional[str] = None,
         split_content: bool = True,
+        path_policy: Optional[PathParsePolicy] = None,
     ) -> Dict[str, Any]:
         """Process one file into the VikingFS directory temp.
 
@@ -983,6 +1019,7 @@ class DirectoryParser(BaseParser):
                     import_root=import_root,
                     split_content=split_content,
                     output_store=output_store,
+                    path_policy=path_policy,
                 )
                 await DirectoryParser._merge_parser_result(
                     classified_file,
