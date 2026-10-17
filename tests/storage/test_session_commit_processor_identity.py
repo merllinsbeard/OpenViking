@@ -112,6 +112,37 @@ async def test_process_requeues_deferred_commit_and_resets_root_context(monkeypa
     assert get_root_observability_context() is None
 
 
+async def test_process_requeues_partial_json_then_resumes_same_snapshot(monkeypatch):
+    queued = []
+    captured = {}
+    session = _FakeSession(captured)
+    loads = 0
+
+    async def load():
+        nonlocal loads
+        loads += 1
+        if loads == 1:
+            raise json.JSONDecodeError("mid-rewrite", "{", 1)
+
+    class Queue:
+        async def enqueue(self, queue_name, data):
+            queued.append((queue_name, data))
+
+    monkeypatch.setattr(session, "load", load)
+    monkeypatch.setattr("openviking.storage.queuefs.get_queue_manager", lambda: Queue())
+    processor = SessionCommitProcessor(_SingleSessionService(session))
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+    msg = _make_msg()
+    msg.memory_policy = {"snapshot": "preserved"}
+
+    assert await processor._process(msg, ctx) is False
+    assert queued == [("SessionCommit", msg.to_dict())]
+    assert get_root_observability_context() is None
+    assert await processor._process(SessionCommitMsg.from_dict(queued[0][1]), ctx) is True
+    assert captured == {"account_id": "acme", "user_id": "alice"}
+    assert loads == 2
+
+
 async def test_cancelled_queued_commit_writes_terminal_marker_before_returning():
     msg = _make_msg()
     viking_fs = _MemoryVikingFS()

@@ -347,6 +347,8 @@ ov write viking://resources/docs/api.md \
 | `wait` | boolean | 否 | `true` | 是否等待语义/向量刷新 |
 | `timeout` | number | 否 | `null` | `wait=true` 时的刷新超时时间（秒） |
 | `telemetry` | boolean/object | 否 | `false` | 是否返回操作遥测信息 |
+| `skip_conflicts` | boolean | 否 | `false` | 保留冲突目标，返回其 URI、错误代码与信息，并执行兼容的操作 |
+| `processing_mode` | string | 否 | `semantic_and_vectors` | 整批使用 `semantic_and_vectors` 或 `vectors_only` |
 
 每个 operation 包含：
 
@@ -356,16 +358,26 @@ ov write viking://resources/docs/api.md \
 | `content` | string | 条件必填 | UTF-8 文本；与 `content_base64` 必须且只能提供一个 |
 | `content_base64` | string | 条件必填 | Base64 编码的字节；Memory 目标不支持 |
 | `mode` | string | 否 | `replace`（默认）、`append`、`create` 或 `upsert` |
+| `expected_sha256` | string | 否 | 已有文件原始字节的小写 SHA-256；获取目标锁后、任何写入前检查 |
 
 **说明**
 
 - 单次请求最多包含 256 个 operation，单文件不超过 8 MiB，总内容不超过 16 MiB。
 - 所有目标必须是 `root_uri` 下的文件、属于同一 context type，且 canonical URI 不能重复。
 - Resource 目标允许任意安全文件扩展名；Memory 目标仍使用文本扩展名白名单，且不接受二进制内容。
-- `replace`、`append`、`create` 与 `write()` 语义一致；`upsert` 会覆盖已有文件或创建缺失文件。
+- `create` 要求目标不存在，`replace` 与 `append` 要求目标存在；`upsert` 会覆盖已有文件或创建缺失文件。单文件 `write()` 同样拒绝对已有目标使用 `create`，但其 `replace` 和 `append` 模式会创建缺失文件。
+- 修改已有文件时，完整读取 raw 内容并提供 `expected_sha256`。创建新文件时使用不带 hash 的 `create`。提供 hash 时，即使 mode 为 `upsert`，目标也必须已存在。
+- Memory 序列化可能添加 `MEMORY_FIELDS`，sidecar 写入会保留 OKF metadata，最终字节可能与请求 body 不同。Hash 使用完整存储形式，reconciliation 需要比较预期的序列化结果。
+- 这些可选前置条件只保护遵守协议的 batch writers。单文件写入、raw storage、import、move 及其他写入方不会自动受到 caller revision 约束。
+- `skip_conflicts=true` 时返回 `conflicts`。revision 匹配且最终字节相同的 replace 列入 `unchanged`，不会重新刷新。旧 hash 即使对应操作已成功执行，也仍然冲突。
+- 响应丢失或部分失败后，逐个比较精确目标的完整期望字节，再决定是否重试。重复 append 可能追加两次。确认内容后，使用当前 raw hash 和 `skip_conflicts=false` 重写最终状态，重试失败的刷新。
+- 要重建派生语义，使用确认后的最终内容、`mode=replace` 和 `processing_mode=semantic_and_vectors`，或调用 `POST /api/v1/content/reindex` 并提供 `mode=semantic_and_vectors`、`force=true`。共享 Resource reindex 需要 admin 身份。确认摘要和向量后才可将 effect 标记为完成。
+- Resource 的 `vectors_only` 只提交文件 embedding，不重建父目录 L0/L1；旧摘要可能仍过时。Memory 刷新行为不变。内容、embedding 完成与派生摘要的新鲜度需要分别验证。
+- `vectors_only` 消息保存本次实际写入的字节。后续写入仍可能比旧任务先入队或完成。并发任务结束后，需要将当前内容 revision 与索引 `md5` 比较并修复过时的派生结果。
 - 整批先获取所有目标文件的精确锁，再校验文件状态并写入；同一目录下不涉及相同文件的写入可以并行，重叠文件的写入或父目录删除、移动仍会冲突。所有文件写完并释放锁后才启动语义处理，统一刷新受影响的 `.overview.md` / `.abstract.md`。
 - 资源父目录刷新与 `write()` 一样采用尽力更新：L0/L1 锁冲突时跳过目录刷新及对应目录向量更新，保留原文和文件自身的处理，不保证自动补刷。
 - 底层 I/O 中途失败时，本批次较早完成的写入仍可能已经可见。
+- Preflight 不提供跨文件 I/O 与刷新事务。`REFRESH_FAILED` 后内容可能已更新。Batch 保留 URI 中的空格，read-back 应使用 URL 编码后的精确 URI 并完整读取 raw 内容。
 - 已存在的 `.abstract.md` / `.overview.md` 可以 replace 或 append；系统会保留并校验受保护的 OKF metadata，并只重建对应目录实际存在的 L0/L1 向量。
 - 响应体中，通过 `semantic_status`（`queued`、`complete`、`deferred` 或 `skipped`）表达目录聚合状态；提交任务前任一目录因锁冲突跳过时为 `skipped`，通过 `vector_status` 表达变化文件的向量维护状态。
 
