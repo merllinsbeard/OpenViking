@@ -30,8 +30,6 @@ def normalize_parse_mode(value: str | ParseMode) -> ParseMode:
 
 @dataclass(frozen=True)
 class PathParsePolicy:
-    """Native modes for import-relative prefixes, longest matching prefix first."""
-
     default: ParseMode
     overrides: tuple[tuple[str, ParseMode], ...]
 
