@@ -1311,8 +1311,6 @@ def _inherit_source_metadata_to_merged_operations(
     input_operations: list[ResolvedOperation],
     merged_operations: list[ResolvedOperation],
 ) -> None:
-    """Restore extraction snapshots by URI, or keep an ambiguous batch candidate set."""
-
     input_by_uri: dict[str, list[ResolvedOperation]] = {}
     for input_op in input_operations or []:
         for uri in list(getattr(input_op, "uris", []) or []):

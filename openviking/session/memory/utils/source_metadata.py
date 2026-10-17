@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""System-owned extraction snapshots, not per-clause evidence."""
 
 import json
 from typing import Any
