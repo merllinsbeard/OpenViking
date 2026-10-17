@@ -285,11 +285,6 @@ class ContentWriteCoordinator:
                 if write_mode == "upsert":
                     write_mode = "replace" if exists else "create"
 
-                if is_abstract_overview_uri(uri):
-                    if not exists:
-                        raise InvalidArgumentError(
-                            f"cannot create generated abstract overview directly: {uri}"
-                        )
                 try:
                     if exists and stat.get("isDir"):
                         raise ConflictError(f"Target is a directory: {uri}")
@@ -310,6 +305,10 @@ class ContentWriteCoordinator:
                         if skip_conflicts and write_mode == "replace" and current == desired:
                             unchanged.append(uri)
                             continue
+                    if is_abstract_overview_uri(uri) and not exists:
+                        raise InvalidArgumentError(
+                            f"cannot create generated abstract overview directly: {uri}"
+                        )
                 except (AlreadyExistsError, NotFoundError, ConflictError) as exc:
                     if not skip_conflicts:
                         raise
