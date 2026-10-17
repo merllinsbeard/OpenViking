@@ -1996,9 +1996,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if not self._ensure_client():
                 return ""
             effective_session_id = str(session_id or self._session_id or "").strip()
-            parts.append(self._session_start_memory_context(effective_session_id))
             if len(query_text) >= _RECALL_QUERY_MIN_CHARS:
                 parts.append(self._search_prefetch_context(query_text, session_id=effective_session_id))
+            parts.insert(0, self._session_start_memory_context(effective_session_id))
         except TimeoutError:
             logger.warning("OpenViking prefetch budget exhausted; retaining completed context")
         finally:

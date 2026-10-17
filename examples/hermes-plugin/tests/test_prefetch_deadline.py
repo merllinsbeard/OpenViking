@@ -64,7 +64,7 @@ def configure(external_provider, endpoint, **settings):
     return provider, module, manager
 
 
-def test_startup_and_query_share_deadline_and_next_turn_recovers(external_provider):
+def test_query_survives_startup_budget_exhaustion_and_next_turn_recovers(external_provider):
     paths = []
     delay_query = [True]
 
@@ -86,7 +86,8 @@ def test_startup_and_query_share_deadline_and_next_turn_recovers(external_provid
         started = time.monotonic()
         block = manager.prefetch_all("Which source should I use?", session_id="deadline-session")
         elapsed = time.monotonic() - started
-        assert "Operator prefers source citations." in block
+        assert "Use the native source first." in block
+        assert "viking://user/test/memories/decision.md" in block
         assert elapsed < 0.85
         assert not manager._external_prefetch_threads
         delay_query[0] = False

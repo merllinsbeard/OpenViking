@@ -287,6 +287,8 @@ query retrieval, full reads and identity retries together. Each HTTP operation
 also has a wall-clock request timeout. Requests within one prefetch share an
 HTTP client and its connections. Expiry cancels the async HTTP operation
 and closes the connection. A timed-out search does not start a fallback request.
+Query recall runs before the session-start listing so a slow listing cannot
+consume its budget. The output still presents the profile before query context.
 Completed context is retained. Capture, commits and explicit tools keep their
 existing timeouts and lifecycle.
 
@@ -297,7 +299,7 @@ memory:
   openviking:
     recall_mode: find
     recall_timeout_seconds: 7
-    recall_request_timeout_seconds: 3
+    recall_request_timeout_seconds: 6
     recall_resources: true
 ```
 
