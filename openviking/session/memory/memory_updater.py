@@ -40,6 +40,10 @@ from openviking.session.memory.utils.resource_refs import (
     RESOURCE_REF_SOURCE_SESSION_COMMIT,
     sync_memory_resource_refs,
 )
+from openviking.session.memory.utils.source_metadata import (
+    SYSTEM_SOURCE_FIELDS,
+    operation_source_metadata,
+)
 from openviking.session.memory.utils.template_utils import TemplateUtils
 from openviking.session.memory.utils.uri import render_template
 from openviking.storage.abstract_overview import freshness_metadata, render_abstract_overview
@@ -269,6 +273,13 @@ class ExtractContext:
                 peer_id=getattr(message, "peer_id", None),
                 parts=[TextPart(chunk)],
                 created_at=message.created_at,
+                turn_id=message.turn_id,
+                message_kind=message.message_kind,
+                source_message_ids=(
+                    list(message.source_message_ids)
+                    if message.source_message_ids is not None
+                    else None
+                ),
             )
             chunk_messages.append(
                 (
@@ -1417,10 +1428,6 @@ class MemoryUpdater:
                     old_content.links,
                 )
             metadata.update(resolved_op.memory_fields)
-            source = getattr(resolved_op, "source", None)
-            source_extraction_id = getattr(source, "extraction_id", None) if source else None
-            if source_extraction_id:
-                metadata["source_extraction_id"] = str(source_extraction_id)
             source_trace_id = _operation_trace_id(resolved_op)
             if source_trace_id:
                 metadata["last_update_trace_id"] = source_trace_id
@@ -1460,6 +1467,14 @@ class MemoryUpdater:
                 for key, val in old_content.extra_fields.items():
                     if key not in schema_field_names and key not in metadata and val is not None:
                         metadata[key] = val
+
+            for key in SYSTEM_SOURCE_FIELDS - {"last_update_trace_id"}:
+                metadata.pop(key, None)
+            metadata.update(
+                operation_source_metadata(
+                    resolved_op, old_fields=old_content.extra_fields if old_content else {}
+                )
+            )
 
             metadata["version"] = next_memory_version(old_content)
 

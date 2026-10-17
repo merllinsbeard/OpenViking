@@ -32,15 +32,11 @@ from openviking.session.memory.utils.line_numbers import (
     every_line_has_line_numbers,
     strip_line_numbers,
 )
+from openviking.session.memory.utils.source_metadata import SYSTEM_SOURCE_FIELDS
 
 _PYTHON_FENCE_RE = re.compile(r"```python[ \t]*\r?\n(?P<code>[\s\S]*?)```", re.IGNORECASE)
 _PYTHON_FENCE_START_RE = re.compile(r"```python[ \t]*\r?\n", re.IGNORECASE)
-_HIDDEN_MEMORY_FIELDS = {
-    "source_extraction_id",
-    "source_extraction_ids",
-    "last_update_trace_id",
-    "version",
-}
+_HIDDEN_MEMORY_FIELDS = SYSTEM_SOURCE_FIELDS | {"version"}
 _SAFE_BUILTINS = {
     "bool": bool,
     "dict": dict,
