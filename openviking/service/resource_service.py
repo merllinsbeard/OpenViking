@@ -29,7 +29,7 @@ from openviking.connector.auth import (
 from openviking.core.namespace import is_content_root_uri
 from openviking.observability.http_error_context import sanitize_public_http_error
 from openviking.parse.backend import ParserBackend, normalize_parser_backend
-from openviking.parse.mode import ParseMode, normalize_parse_mode
+from openviking.parse.mode import ParseMode, PathParsePolicy, normalize_parse_mode
 from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS
 from openviking.resource.feishu_watch_auth import (
     FEISHU_ACCESS_TOKEN_ARG,
@@ -470,6 +470,8 @@ class ResourceService:
             )
 
         normalized = dict(args)
+        if "parse_mode_overrides" in normalized:
+            PathParsePolicy.from_options(True, normalized["parse_mode_overrides"])
         validate_feishu_auth_args(normalized)
         raw_parse_mode = normalized.pop("parse_mode", ParseMode.DEFAULT)
         try:

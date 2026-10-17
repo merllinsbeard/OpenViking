@@ -201,6 +201,7 @@ This endpoint is the core entry point for resource management. It supports vario
 - Native HTTPS Git imports and watches accept HTTP Basic credentials over TLS as `args.auth_config={"username":"oauth2","token":"..."}`; `username` defaults to `oauth2`. Git `branch` or `commit` remains at the top level of `args`.
 - To import a private TOS object through its HTTP(S) URL, pass exactly one non-empty string: `args.tos_signature` (sent as `X-Tos-Signature`) or `args.tos_access` (sent as `X-Tos-Access`). TOS credentials are used only for the current HEAD/GET fetch, which is staged as a snapshot; they are not persisted to resource metadata or queue jobs.
 - `args.parse_mode` accepts `default` (existing splitting behavior) or `no_split` (parse and convert each source document to one Markdown body).
+- `args.parse_mode_overrides` accepts an object mapping import-relative POSIX path prefixes to `default` or `no_split` for native directory parsing. The longest matching prefix wins. A prefix matches the exact path or descendants separated by `/`, so `journal` does not match `journal-other`. Unmatched files retain the import's existing parse mode and `split_content` behavior. Prefixes must be nonempty and cannot contain absolute paths, drive names, backslashes, control characters, empty segments, `.` segments, or `..` segments. Trailing slashes are rejected. This option does not select files or change access permissions. Git repositories retain their code-parser layout.
 - `args.site=true/false` forces/opts out of whole-site (sitemap/RSS) ingestion, `args.max_pages` etc. override the `webfeed` config; the recursive web crawler accepts `args.depth`, `args.max_pages`, `args.include_paths`, `args.exclude_paths`, `args.allow_external_links`, `args.skip_download_links`.
 - Feishu user-token imports pass `args.feishu_access_token`.
 - Core `add_resource` fields such as `path`, `to`, `watch_interval`, and `include` are not allowed inside `args`. Native imports also reject `args.exclude`; TOS Connector imports accept it with `args.tos_prefix`.
@@ -237,6 +238,22 @@ This endpoint is the core entry point for resource management. It supports vario
 - For a single-file input in `no_split` mode, when parsing produces exactly one visible file and `to` is omitted, that file is stored directly under the resolved parent (for example, `guide.md` becomes `viking://resources/guide.md`). No wrapper directory or directory-level `.abstract.md` / `.overview.md` is created. If parsing also produces images or other visible files, the wrapper directory is retained. An explicit `to` is always preserved as the exact final URI.
 - `no_split` changes only the stored Markdown layout. Semantic processing, file vectorization, and any internal embedding chunking remain unchanged. Relative Markdown links are resolved against the same no-split output layout, so links do not point to split-only paths. Understanding is not called for directory files in this mode.
 - To create or update plain text directly, use [content/write](12-content.md#write) instead of `add_resource`. Semantic processing and embeddings are refreshed automatically after resource ingestion and content writes.
+
+A single directory import can preserve a mixed native Markdown layout:
+
+```json
+{
+  "args": {
+    "parse_mode": "default",
+    "parse_mode_overrides": {
+      "journal": "no_split",
+      "journal/docs": "default"
+    }
+  }
+}
+```
+
+With `preserve_structure=true`, `journal/day.md` produces `journal/day.md`, while a small `docs/guide.md` produces `docs/guide/guide.md`. Frontmatter titles and local images still affect names and layout through the normal Markdown parser. Supported inline Markdown links use the target file's mode, including anchors into split sections. Reference-style links remain unchanged. Missing targets retain their original links. Existing exact-name collisions can overwrite an earlier output; case-only collisions in the local artifact store appear in `meta.failed_files`. Inspect failures before accepting a snapshot. These existing limitations also apply to imports with overrides. Omitting the option preserves the existing parser behavior.
 
 #### 3. Usage Examples
 
