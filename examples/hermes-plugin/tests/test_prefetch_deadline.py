@@ -56,6 +56,8 @@ def configure(external_provider, endpoint, **settings):
            "recall_timeout_seconds": 0.6, "recall_request_timeout_seconds": 0.5,
            "recall_prefer_abstract": True, **settings}
     (home / "config.yaml").write_text(yaml.safe_dump({"memory": {"provider": "openviking", "openviking": cfg}}))
+    provider._hermes_home = str(home)
+    provider._hermes_home_bound = True
     provider._endpoint = endpoint
     provider._client = module._VikingClient(endpoint, "test-key", account="test", user="test", agent="")
     provider._session_id = "deadline-session"
