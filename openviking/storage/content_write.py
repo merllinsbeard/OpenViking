@@ -232,8 +232,8 @@ class ContentWriteCoordinator:
     ) -> Dict[str, Any]:
         """Write a bundle under one directory, then refresh it as a batch.
 
-        Each operation follows the same create/replace/append semantics as ``write``;
-        ``upsert`` is available for callers that already hold the desired final tree.
+        Batch ``create`` requires an absent target; ``replace`` and ``append``
+        require an existing file. ``upsert`` selects create or replace from its state.
         All target files stay locked from state validation through the last write,
         while unrelated files remain writable. Refresh starts after the locks are released.
         An optional expected_sha256 checks the existing raw bytes under these locks.
@@ -441,7 +441,7 @@ class ContentWriteCoordinator:
 
         if write_error is not None:
             raise write_error
-        result = {
+        result: Dict[str, Any] = {
             "root_uri": normalized_root,
             "created": created,
             "updated": updated,

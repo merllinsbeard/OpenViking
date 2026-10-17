@@ -365,7 +365,7 @@ Each operation contains:
 - A request supports at most 256 operations, 8 MiB per file, and 16 MiB total.
 - All targets must be files below `root_uri`, use the same context type, and have unique canonical URIs.
 - Resource targets may use any safe file extension; Memory targets retain the text extension allowlist and do not accept binary content.
-- `create` requires a missing target. `replace` and `append` require an existing target. `upsert` replaces an existing file or creates a missing file. These batch preconditions are stricter than single `write()` materialization.
+- `create` requires a missing target. `replace` and `append` require an existing target. `upsert` replaces an existing file or creates a missing file. Single `write()` also rejects occupied `create` targets, but its `replace` and `append` modes materialize missing files.
 - For read-modify-replace, read the complete raw content and send its `expected_sha256`. For a new file, use `create` without an expected hash. A hash always requires an existing file, including with `upsert`.
 - Memory serialization can add `MEMORY_FIELDS`, and sidecar writes preserve OKF metadata. Their final stored bytes can differ from the supplied body. Hash the complete stored representation and reconcile the intended serialized result rather than assuming the request body is the raw result.
 - These optional preconditions protect participating batch writers. Single writes, raw storage, imports, moves, and other writers do not acquire a caller revision contract automatically.

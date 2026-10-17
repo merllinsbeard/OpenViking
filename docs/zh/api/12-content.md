@@ -365,7 +365,7 @@ ov write viking://resources/docs/api.md \
 - 单次请求最多包含 256 个 operation，单文件不超过 8 MiB，总内容不超过 16 MiB。
 - 所有目标必须是 `root_uri` 下的文件、属于同一 context type，且 canonical URI 不能重复。
 - Resource 目标允许任意安全文件扩展名；Memory 目标仍使用文本扩展名白名单，且不接受二进制内容。
-- `create` 要求目标不存在，`replace` 与 `append` 要求目标存在；`upsert` 会覆盖已有文件或创建缺失文件。批量操作比单文件 `write()` 的创建语义更严格。
+- `create` 要求目标不存在，`replace` 与 `append` 要求目标存在；`upsert` 会覆盖已有文件或创建缺失文件。单文件 `write()` 同样拒绝对已有目标使用 `create`，但其 `replace` 和 `append` 模式会创建缺失文件。
 - 修改已有文件时，完整读取 raw 内容并提供 `expected_sha256`。创建新文件时使用不带 hash 的 `create`。提供 hash 时，即使 mode 为 `upsert`，目标也必须已存在。
 - Memory 序列化可能添加 `MEMORY_FIELDS`，sidecar 写入会保留 OKF metadata，最终字节可能与请求 body 不同。Hash 使用完整存储形式，reconciliation 需要比较预期的序列化结果。
 - 这些可选前置条件只保护遵守协议的 batch writers。单文件写入、raw storage、import、move 及其他写入方不会自动受到 caller revision 约束。
