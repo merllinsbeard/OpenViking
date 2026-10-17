@@ -84,7 +84,7 @@ test("keeps metadata through custom tools, agent messages and nested messages", 
 test("keeps child metadata and inherited turn identity through history append", () => {
   const turns = extractCaptureTurns([{
     timestamp: "2026-10-18T00:00:00Z", type: "history_mutation",
-    payload: { operation: "append", turn_id: "history-turn", items: [
+    payload: { operation: "append", turn_id: "history-turn", source_message_ids: ["history-wrapper"], items: [
       { type: "message", role: "user", content: [{ type: "input_text", text: "History question" }],
         id: "history-message", created_at: source.created_at, source_message_ids: ["history-source"], message_kind: "checkpoint" },
     ] },
@@ -92,7 +92,7 @@ test("keeps child metadata and inherited turn identity through history append", 
   assert.deepEqual(turns, [{
     role: "user", text: "History question", parts: [{ type: "text", text: "History question" }],
     created_at: source.created_at, turn_id: "history-turn", message_kind: "checkpoint",
-    source_message_ids: ["history-source", "history-message"],
+    source_message_ids: ["history-wrapper", "history-source", "history-message"],
   }]);
 });
 
@@ -140,6 +140,28 @@ test("response replay keeps the old first-wins content and unions refs", () => {
   assert.deepEqual(first.payload.source_message_ids, ["ref-first"]);
 });
 
+test("conflicting scalars stay absent after response replay and completed-tool dedup", () => {
+  const call = (timestamp, turn_id, message_kind) => ({ timestamp, type: "response_item", payload: {
+    type: "function_call", call_id: "conflicting-call", name: "exec_command", arguments: { cmd: "pwd" }, turn_id, message_kind,
+  } });
+  const turns = extractCaptureTurns([
+    call(source.created_at, "first-turn", "assistant_step"),
+    call("2026-10-18T00:00:00Z", "second-turn", "tool_transport"),
+    { timestamp: source.created_at, type: "event_msg", payload: {
+      type: "exec_command_end", call_id: "conflicting-call", command: "pwd", aggregated_output: "project root",
+      turn_id: "first-turn", message_kind: "assistant_step", source_message_ids: ["completed-source"],
+    } },
+  ], cfg);
+  assert.equal(turns.length, 2);
+  for (const turn of turns) {
+    assert.equal(turn.created_at, undefined);
+    assert.equal(turn.turn_id, undefined);
+    assert.equal(turn.message_kind, undefined);
+    assert.deepEqual(turn.source_message_ids, ["completed-source"]);
+  }
+  assert.equal(turns[1].parts[0].tool_output, "project root");
+});
+
 test("payload builder preserves source fields in batch and serial fallback without replay", async (t) => {
   const stateDir = await mkdtemp(join(tmpdir(), "ov-codex-source-"));
   const previous = process.env.OPENVIKING_CODEX_STATE_DIR;
@@ -152,7 +174,8 @@ test("payload builder preserves source fields in batch and serial fallback witho
   for (const serial of [false, true]) {
     const id = `source-${serial}`;
     const transcriptPath = join(stateDir, `${id}.jsonl`);
-    const records = [message("Captured prefix"), message("New source message", source)];
+    const records = [message("Captured prefix"), message("New source message", source),
+      { ...message("Unknown payload metadata"), timestamp: undefined }];
     await writeFile(transcriptPath, records.map(JSON.stringify).join("\n"));
     const state = await loadState(id);
     state.captureFormatVersion = CAPTURE_FORMAT_VERSION;
@@ -166,11 +189,14 @@ test("payload builder preserves source fields in batch and serial fallback witho
       return { ok: true, status: 200 };
     };
     const first = await catchUpTurns({ state, transcriptPath, cfg, activePeerId: "project", fetchJSONRes });
-    assert.equal(first.added, 1);
-    assert.deepEqual(sent, [{ role: "user", parts: [{ type: "text", text: "New source message" }], peer_id: "project", ...source }]);
-    assert.equal((await loadState(id)).capturedTurnCount, 2);
+    assert.equal(first.added, 2);
+    assert.deepEqual(sent, [
+      { role: "user", parts: [{ type: "text", text: "New source message" }], peer_id: "project", ...source },
+      { role: "user", parts: [{ type: "text", text: "Unknown payload metadata" }], peer_id: "project" },
+    ]);
+    assert.equal((await loadState(id)).capturedTurnCount, 3);
     assert.equal((await catchUpTurns({ state, transcriptPath, cfg, fetchJSONRes })).added, 0);
-    assert.equal(sent.length, 1);
+    assert.equal(sent.length, 2);
     assert.equal(JSON.parse(await readFile(join(stateDir, `${id}.json`), "utf8")).captureFormatVersion, CAPTURE_FORMAT_VERSION);
   }
 });
