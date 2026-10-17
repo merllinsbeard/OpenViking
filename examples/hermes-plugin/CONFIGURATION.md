@@ -284,7 +284,8 @@ resource and directory cleanup.
 
 The total recall timeout covers connection refresh, the session-start profile,
 query retrieval, full reads and identity retries together. Each HTTP operation
-also has a wall-clock request timeout. Expiry cancels its async HTTP operation
+also has a wall-clock request timeout. Requests within one prefetch share an
+HTTP client and its connections. Expiry cancels the async HTTP operation
 and closes the connection. A timed-out search does not start a fallback request.
 Completed context is retained. Capture, commits and explicit tools keep their
 existing timeouts and lifecycle.

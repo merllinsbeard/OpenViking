@@ -168,16 +168,37 @@ _INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
 _INVALID_SETTING_WARNINGS_LOCK = threading.Lock()
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RecallBudget:
     deadline: float
     request_timeout: float
+    runner: asyncio.Runner = field(default_factory=asyncio.Runner, repr=False)
+    client: Any = field(default=None, init=False, repr=False)
 
     def remaining(self, timeout: Optional[float] = None) -> float:
         remaining = self.deadline - time.monotonic()
         if remaining <= _RECALL_MIN_TIMEOUT_SECONDS:
             raise TimeoutError("OpenViking recall budget exhausted")
         return min(remaining, self.request_timeout, timeout if timeout is not None else self.request_timeout)
+
+    def request(self, httpx, method: str, url: str, *, timeout: float, **kwargs):
+        async def request():
+            if self.client is None:
+                self.client = httpx.AsyncClient()
+            return await self.client.request(method, url, timeout=timeout, **kwargs)
+
+        async def bounded_request():
+            remaining = self.remaining(timeout)
+            return await asyncio.wait_for(request(), timeout=remaining)
+
+        return self.runner.run(bounded_request())
+
+    def close(self) -> None:
+        try:
+            if self.client is not None:
+                self.runner.run(self.client.aclose())
+        finally:
+            self.runner.close()
 
 
 _recall_budget: ContextVar[Optional[_RecallBudget]] = ContextVar("openviking_recall_budget", default=None)
@@ -387,15 +408,7 @@ class _VikingClient:
         if budget is None:
             return getattr(self._httpx, method)(f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
 
-        async def request():
-            async with self._httpx.AsyncClient() as client:
-                return await client.request(method, f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
-
-        async def bounded_request():
-            remaining = budget.remaining(timeout)
-            return await asyncio.wait_for(request(), timeout=remaining)
-
-        return asyncio.run(bounded_request())
+        return budget.request(self._httpx, method, f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
 
     def get(self, path: str, **kwargs) -> dict:
         return self._request("get", path, kwargs)
@@ -1969,7 +1982,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """Session-start memory block (once per session) + query recall."""
         started = time.monotonic()
         cfg = self._recall_config()
-        token = _recall_budget.set(_RecallBudget(started + cfg["timeout_seconds"], cfg["request_timeout_seconds"]))
+        budget = _RecallBudget(started + cfg["timeout_seconds"], cfg["request_timeout_seconds"])
+        token = _recall_budget.set(budget)
         parts = []
         query_text = _derive_openviking_user_text(query).strip()
         try:
@@ -1983,6 +1997,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.warning("OpenViking prefetch budget exhausted; retaining completed context")
         finally:
             _recall_budget.reset(token)
+            budget.close()
         parts = [p for p in parts if p]
         return "## OpenViking Context\n" + "\n\n".join(parts) if parts else ""
 
