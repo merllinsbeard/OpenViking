@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from openviking.parse import registry
+from openviking.parse.feishu_import import FeishuImportPlan
 from openviking.parse.output import LocalParseOutputStore, read_artifact_manifest
 from openviking.parse.parsers.directory import DirectoryParser
 from openviking.server.identity import RequestContext, Role
@@ -48,6 +49,174 @@ async def parse_files(root: Path, store: LocalParseOutputStore, **options) -> di
     }
     await store.cleanup(ref)
     return files
+
+
+def configure_pdf_understanding(**directory_limits) -> None:
+    OpenVikingConfigSingleton.initialize(
+        config_dict={
+            "parser_api": {
+                "enable": True,
+                "extensions": ["pdf"],
+                "host": "http://127.0.0.1:1",
+                "api_key": "synthetic-noncredential",
+            },
+            "directory": directory_limits,
+        }
+    )
+    registry._default_registry = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"parse_mode_overrides": {"journal": "no_split"}},
+        {"split_content": False, "parse_mode_overrides": {}},
+    ],
+)
+async def test_unmaterialized_feishu_no_split_rejected_before_output(
+    tmp_path, parser_config, options
+):
+    root = tmp_path / "source"
+    write_sources(root, {"local.md": "# Local\n\nNative body.\n"})
+    placeholder = root / "journal/doc.md"
+    placeholder.parent.mkdir()
+    plan = FeishuImportPlan(root, use_understanding=True)
+    plan.add(placeholder, "https://example.invalid/docx/synthetic", "synthetic-token", "url")
+    artifacts = tmp_path / "artifacts"
+    store = LocalParseOutputStore(str(artifacts))
+    with pytest.raises(InvalidArgumentError, match="no_split.*materialized.*journal/doc.md"):
+        await DirectoryParser().parse(
+            root,
+            parse_output_store=store,
+            parser_backend="understanding",
+            _feishu_import_plan=plan,
+            **options,
+        )
+    assert not placeholder.exists()
+    assert list(artifacts.rglob("*")) == []
+    assert (root / "local.md").read_bytes() == b"# Local\n\nNative body.\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [True, False])
+@pytest.mark.parametrize("policy", [None, {"journal": "no_split"}])
+async def test_materialized_feishu_markdown_retains_native_modes(
+    tmp_path, parser_config, split, policy
+):
+    root = tmp_path / "source"
+    write_sources(root, {"journal/doc.md": "# Document\n\nMaterialized body.\n"})
+    plan = FeishuImportPlan(root, use_understanding=True)
+    plan.add(root / "journal/doc.md", "https://example.invalid/docx/synthetic", "token", "markdown")
+    store = LocalParseOutputStore(str(tmp_path / "artifacts"))
+    files = await parse_files(
+        root,
+        store,
+        split_content=split,
+        parser_backend="understanding",
+        _feishu_import_plan=plan,
+        **({"parse_mode_overrides": policy} if policy is not None else {}),
+    )
+    expected_path = "journal/doc/doc.md" if split and policy is None else "journal/doc.md"
+    assert files == {expected_path: b"# Document\n\nMaterialized body.\n"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["max_depth", "max_files"])
+@pytest.mark.parametrize("policy", [None, {}, {"missing": "default"}, {"a": "default"}])
+async def test_native_only_policy_preserves_no_split_admission(
+    tmp_path, parser_config, limit, policy
+):
+    configure_pdf_understanding(**{limit: 2 if limit == "max_depth" else 1})
+    root = tmp_path / "source"
+    sources = (
+        {"a/b/c/note.md": "# Note\n\nNative body.\n"}
+        if limit == "max_depth"
+        else {"a/note.md": "# Note\n\nNative body.\n", "other.md": "# Other\n\nNative other.\n"}
+    )
+    write_sources(root, sources)
+    store = LocalParseOutputStore(str(tmp_path / "artifacts"))
+    files = await parse_files(
+        root,
+        store,
+        split_content=False,
+        **({"parse_mode_overrides": policy} if policy is not None else {}),
+    )
+    if limit == "max_depth":
+        expected = (
+            {"a/b/c/note/note.md": b"# Note\n\nNative body.\n"}
+            if policy == {"a": "default"}
+            else {"a/b/c/note.md": b"# Note\n\nNative body.\n"}
+        )
+    else:
+        expected = {
+            "a/note/note.md"
+            if policy == {"a": "default"}
+            else "a/note.md": b"# Note\n\nNative body.\n",
+            "other.md": b"# Other\n\nNative other.\n",
+        }
+    assert files == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["max_depth", "max_files"])
+@pytest.mark.parametrize("policy", [False, True])
+async def test_understanding_candidate_retains_native_scan_limits(
+    tmp_path, parser_config, limit, policy
+):
+    configure_pdf_understanding(**{limit: 2 if limit == "max_depth" else 1})
+    root = tmp_path / "source"
+    write_sources(
+        root,
+        {"a/b/c/paper.pdf": "%PDF-1.7\n"}
+        if limit == "max_depth"
+        else {"a.md": "# A\n\nNative body.\n", "paper.pdf": "%PDF-1.7\n"},
+    )
+    artifacts = tmp_path / "artifacts"
+    store = LocalParseOutputStore(str(artifacts))
+    expected = (
+        "depth=3, max_depth=2, path=a/b/c" if limit == "max_depth" else "count=2, max_files=1"
+    )
+    with pytest.raises(InvalidArgumentError, match=expected):
+        await DirectoryParser().parse(
+            root,
+            parse_output_store=store,
+            split_content=not policy,
+            **(
+                {"parse_mode_overrides": {"paper.pdf": "default", "a": "default"}} if policy else {}
+            ),
+        )
+    assert list(artifacts.rglob("*")) == []
+    assert next(root.rglob("*.pdf")).read_bytes() == b"%PDF-1.7\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", [{"include": "*.md"}, {"exclude": "paper.pdf"}])
+async def test_filtered_understanding_candidate_does_not_enable_limits(
+    tmp_path, parser_config, selection
+):
+    configure_pdf_understanding(max_depth=1, max_files=1)
+    root = tmp_path / "source"
+    write_sources(
+        root,
+        {
+            "a/b/paper.pdf": "%PDF-1.7\n",
+            "a/b/note.md": "# Note\n\nNative body.\n",
+            "other.md": "# Other\n\nNative other.\n",
+        },
+    )
+    store = LocalParseOutputStore(str(tmp_path / "artifacts"))
+    files = await parse_files(
+        root,
+        store,
+        split_content=False,
+        parse_mode_overrides={"a/b/paper.pdf": "default"},
+        **selection,
+    )
+    assert files == {
+        "a/b/note.md": b"# Note\n\nNative body.\n",
+        "other.md": b"# Other\n\nNative other.\n",
+    }
 
 
 @pytest.mark.asyncio
