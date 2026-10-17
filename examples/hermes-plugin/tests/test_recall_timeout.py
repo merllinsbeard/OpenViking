@@ -40,6 +40,8 @@ def recall_provider(external_provider, monkeypatch):
             }]}},
         )
 
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: async_client(transport=httpx.MockTransport(handle)))
     with httpx.Client(transport=httpx.MockTransport(handle)) as client:
         monkeypatch.setattr(httpx, "get", client.get)
         monkeypatch.setattr(httpx, "post", client.post)
@@ -75,16 +77,20 @@ def test_timeout_warns_without_private_text_or_extra_requests(recall_provider, c
     assert requests == ["/api/v1/search/find"]
 
 
-def test_recovered_session_search_timeout_is_quiet(recall_provider, caplog):
+def test_session_search_timeout_does_not_retry(recall_provider, caplog):
     provider, _module, requests, behavior = recall_provider
     behavior.update(error=httpx.ReadTimeout, fallback=True)
     with caplog.at_level(logging.WARNING, logger=type(provider).__module__):
         result = provider._search_prefetch_context(
             "what was the decision", session_id="recall-session", client=provider._client
         )
-    assert "The decision is retained." in result
-    assert requests == ["/api/v1/search/search", "/api/v1/search/find"]
-    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert result == ""
+    assert requests == ["/api/v1/search/search"]
+    assert any("recall timed out" in record.getMessage() for record in caplog.records)
+    behavior["error"] = None
+    assert "The decision is retained." in provider._search_prefetch_context(
+        "what was the decision", session_id="recall-session", client=provider._client
+    )
 
 
 def test_non_timeout_error_keeps_existing_debug_behavior(recall_provider, caplog):
@@ -154,7 +160,7 @@ def test_public_prefetch_exhausted_budget_warns_without_fallback_request(
     behavior["respond"] = respond
     with caplog.at_level(logging.WARNING, logger=type(provider).__module__):
         assert provider.prefetch("private query", session_id="recall-session") == ""
-    assert_timeout_warning(caplog, provider, TimeoutError)
+    assert_timeout_warning(caplog, provider, httpx.ReadTimeout)
     assert requests == (
         ["/api/v1/system/status"] if scope == "peer" else []
     ) + ["/api/v1/search/search"]
@@ -173,7 +179,7 @@ def test_identity_probe_default_preserves_existing_fallback(
 
 
 @pytest.mark.parametrize("compress", ["server", "auto"])
-def test_public_compression_timeout_with_successful_fallback_is_quiet(
+def test_public_compression_timeout_does_not_retry(
     recall_provider, caplog, compress
 ):
     provider, _module, requests, behavior = recall_provider
@@ -190,6 +196,8 @@ def test_public_compression_timeout_with_successful_fallback_is_quiet(
     behavior["respond"] = respond
     with caplog.at_level(logging.WARNING, logger=type(provider).__module__):
         result = provider.prefetch("private query", session_id="recall-session")
-    assert "The decision is retained." in result
-    assert requests == ["/api/v1/search/search", "/api/v1/search/search"]
-    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert result == ""
+    assert requests == ["/api/v1/search/search"]
+    assert_timeout_warning(caplog, provider, httpx.ReadTimeout)
+    behavior["respond"] = None
+    assert "The decision is retained." in provider.prefetch("private query", session_id="recall-session")

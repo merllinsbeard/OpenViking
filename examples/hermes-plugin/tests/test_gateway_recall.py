@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-import yaml
+from hermes_cli.config import yaml
 
 
 @contextmanager
@@ -146,6 +146,7 @@ def initialize(
     )
     backend = GatewayBackend()
     client = httpx.Client(transport=httpx.MockTransport(backend))
+    client.AsyncClient = lambda: httpx.AsyncClient(transport=httpx.MockTransport(backend))
     monkeypatch.setattr(module, "_get_httpx", lambda: client)
     manager = MemoryManager(external_prefetch_timeout=10)
     manager.add_provider(provider)
@@ -158,6 +159,25 @@ def initialize(
             **identity,
         )
     return home, provider, module, manager, backend
+
+
+@pytest.mark.parametrize("mode", ["find", "context"])
+def test_native_recall_routes_preserve_sender_scope(external_provider, monkeypatch, mode):
+    home, provider, _, manager, backend = initialize(external_provider, monkeypatch)
+    with profile_scope(home):
+        provider.save_config({"recall_mode": mode}, str(home))
+        provider.on_turn_start(1, "Recall preferences", author_id="alice")
+        block = manager.prefetch_all("Recall preferences", session_id="shared-group")
+    assert "common" in block and "alice" in block and "resource" in block
+    assert "bob" not in block and "assistant" not in block
+    request, payload = backend.searches[-1]
+    if mode == "find":
+        assert request.url.path == "/api/v1/search/find"
+        assert "session_id" not in payload
+    else:
+        assert payload["mode"] == "context"
+        assert payload["query_expansion"] == "off"
+        assert payload["rewrite"] is False
 
 
 @pytest.mark.parametrize("compress", ["off", "server"])

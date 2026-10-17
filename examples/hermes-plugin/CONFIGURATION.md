@@ -280,6 +280,51 @@ strings or fragments. Use OpenViking's MCP, CLI, or admin APIs for broader
 resource and directory cleanup.
 
 
+### Recall within a host deadline
+
+The total recall timeout covers connection refresh, the session-start profile,
+query retrieval, full reads and identity retries together. Each HTTP operation
+also has a wall-clock request timeout. Requests within one prefetch share an
+HTTP client and its connections. Expiry cancels the async HTTP operation
+and closes the connection. A timed-out search does not start a fallback request.
+Query recall runs before the session-start listing so a slow listing cannot
+consume its budget. The output still presents the profile before query context.
+Completed context is retained. Capture, commits and explicit tools keep their
+existing timeouts and lifecycle.
+
+Choose a retrieval route in the active profile:
+
+```yaml
+memory:
+  openviking:
+    recall_mode: find
+    recall_timeout_seconds: 7
+    recall_request_timeout_seconds: 6
+    recall_resources: true
+```
+
+`OPENVIKING_RECALL_MODE` overrides the YAML value. Supported modes are:
+
+| Mode | Route |
+|------|-------|
+| `auto` | Existing session-aware search and optional compression. This is the default. |
+| `find` | Native text `search/find`, without a session query planner or rewrite. |
+| `context` | Native `search/search` with `mode=context`, `query_expansion=off` and `rewrite=false`. Unsupported context requests fall back to scoped `find`. |
+
+Explicit `find` and `context` modes take precedence over `recall_compress`.
+They retain the existing identity, sender scope and source URI handling.
+Context mode gives native assembly a token budget of
+`recall_max_injected_chars // 4`, bounded to 64–32000 tokens. `recall_limit`
+limits list/find selection, rather than the number of assembled context entries.
+Embeddings can still use the server's embedding provider. They do not run a
+local compressor. `recall_context_mode` is not a supported setting.
+
+Hermes's external-provider wait defaults to eight seconds on the tested host.
+Keep the provider's total timeout below the host's wait. The example leaves
+one second for local scheduling and assembly. It cannot guarantee delivery
+when the server or embedding service cannot finish within the remaining budget.
+Quick Local installation and initial provider setup are separate from prefetch.
+
 ### Cloud recall compression
 
 Set `OPENVIKING_RECALL_COMPRESS=server` to enable cloud recall compression, or
@@ -289,7 +334,8 @@ The server digest takes precedence over the original search results, and `no_rel
 adds no memory to the prompt. The default is `off`. No local compressor is started.
 
 The Hermes config equivalent is `memory.openviking.recall_compress: server`.
-When enabled, the default request timeout and total recall budget become 55 seconds.
+In `auto` mode, compression gives the default request timeout and total recall
+budget 55 seconds.
 Explicit recall timeout settings still take precedence. Older servers fall back
 to the existing search path within that deadline.
 
