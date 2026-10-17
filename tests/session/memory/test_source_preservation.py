@@ -14,6 +14,7 @@ from openviking.session.memory.dataclass import (
     MemoryOperationSource,
     MemoryTypeSchema,
     ResolvedOperation,
+    ResolvedOperations,
 )
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.extraction_output_protocol import (
@@ -39,6 +40,7 @@ from openviking.session.memory.tools import MemoryReadTool
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.agfs_config import AGFSConfig
 
@@ -248,7 +250,13 @@ async def test_native_persistence_unions_replay_and_rename(native_target):
     )
     await fs.write_file(URI, MemoryFileUtils.write(old), ctx=ctx)
     for version in (4, 5):
-        await updater._apply_upsert(operation(B), ctx)
+        result = await updater.apply_operations(
+            ResolvedOperations(
+                upsert_operations=[operation(B)], delete_file_contents=[], errors=[]
+            ),
+            ctx,
+        )
+        assert result.errors == []
         raw = await fs.read_file(URI, ctx=ctx)
         fields = json.loads(raw.split("<!-- MEMORY_FIELDS\n", 1)[1].removesuffix("\n-->"))
         assert fields["source_extractions"] == [A, B]
@@ -258,7 +266,18 @@ async def test_native_persistence_unions_replay_and_rename(native_target):
         assert fields["version"] == version
         assert raw.startswith("Updated text.\n\n<!-- MEMORY_FIELDS\n")
     snapshot = MemoryFileUtils.read(raw, uri=URI)
-    await updater._apply_upsert(operation(uri=RENAMED, old=snapshot, name="renamed"), ctx)
+    result = await updater.apply_operations(
+        ResolvedOperations(
+            upsert_operations=[operation(uri=RENAMED, old=snapshot, name="renamed")],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        ctx,
+    )
+    assert result.errors == []
+    assert result.deleted_uris == [URI]
+    with pytest.raises(NotFoundError):
+        await fs.read_file(URI, ctx=ctx)
     renamed = MemoryFileUtils.read(await fs.read_file(RENAMED, ctx=ctx), uri=RENAMED)
     assert renamed.extra_fields["source_extractions"] == [A, B]
     assert renamed.extra_fields["source_extraction_ids"] == ["extract-a", "extract-b"]

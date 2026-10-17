@@ -345,6 +345,8 @@ class ResolvedOperation(BaseModel):
     uris: List[str]
     page_id: Optional[int] = None  # Temporary page_id for link resolution (not persisted)
     source: Optional[MemoryOperationSource] = None
+    sources: List[MemoryOperationSource] = Field(default_factory=list)
+    source_ambiguous: bool = False
     # Runtime-only resolution decision. It is deliberately excluded from model
     # serialization so it cannot enter later LLM merge prompts or memory files.
     resolution_skip: Optional[MemoryOperationSkip] = Field(default=None, exclude=True)

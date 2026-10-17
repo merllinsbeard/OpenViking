@@ -50,6 +50,11 @@ from openviking.session.memory.patch_merge_context_provider import (
 )
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils, next_memory_version
+from openviking.session.memory.utils.source_metadata import (
+    SYSTEM_SOURCE_FIELDS,
+    extraction_ids,
+    operation_source_metadata,
+)
 from openviking.session.memory.utils.streaming_batcher import (
     StreamingBatcher,
     StreamingBatcherConfig,
@@ -1185,9 +1190,6 @@ async def render_operation_after_file_content(
 ) -> str:
     old_content = getattr(op, "old_memory_file_content", None)
     metadata: dict[str, Any] = dict(getattr(op, "memory_fields", {}) or {})
-    source_extraction_id = source_extraction_id_for_operation(op)
-    if source_extraction_id:
-        metadata["source_extraction_id"] = source_extraction_id
     source_trace_id = source_trace_id_for_operation(op)
     if source_trace_id:
         metadata["last_update_trace_id"] = source_trace_id
@@ -1227,6 +1229,9 @@ async def render_operation_after_file_content(
             if key not in schema_field_names and key not in metadata and value is not None:
                 metadata[key] = value
     metadata["version"] = next_memory_version(old_content)
+    for key in SYSTEM_SOURCE_FIELDS - {"last_update_trace_id"}:
+        metadata.pop(key, None)
+    metadata.update(operation_source_metadata(op))
     metadata.setdefault("memory_type", op.memory_type)
     mf = MemoryFile.from_parsed(uri=_first_uri(op.uris), parsed=dict(metadata))
     return MemoryFileUtils.write(
@@ -1306,55 +1311,50 @@ def _inherit_source_metadata_to_merged_operations(
     input_operations: list[ResolvedOperation],
     merged_operations: list[ResolvedOperation],
 ) -> None:
-    """Best-effort provenance restore after patch-merge LLM output.
-
-    Patch merge hides system provenance fields from the model, so generated
-    operations can lose source_extraction_id. Reattach it by exact URI match
-    where possible. If a merged output has no URI match but only one input
-    source exists, copy that source; otherwise record all input source IDs as an
-    ambiguous multi-source operation.
-    """
+    """Restore extraction snapshots by URI, or keep an ambiguous batch candidate set."""
 
     input_by_uri: dict[str, list[ResolvedOperation]] = {}
-    all_source_ids: set[str] = set()
     for input_op in input_operations or []:
-        op_source_ids = _operation_source_extraction_ids(input_op)
-        all_source_ids.update(op_source_ids)
         for uri in list(getattr(input_op, "uris", []) or []):
             if uri:
                 input_by_uri.setdefault(uri, []).append(input_op)
 
-    if not all_source_ids:
-        return
-
     for merged_op in merged_operations or []:
-        if _operation_source_extraction_ids(merged_op):
-            continue
+        target_uris = list(merged_op.uris or [])
+        exact_match = bool(target_uris) and all(uri in input_by_uri for uri in target_uris)
         matched_inputs: list[ResolvedOperation] = []
-        for uri in list(getattr(merged_op, "uris", []) or []):
+        for uri in target_uris:
             matched_inputs.extend(input_by_uri.get(uri, []))
-        matched_ids = {
-            source_id
-            for input_op in matched_inputs
-            for source_id in _operation_source_extraction_ids(input_op)
+        candidates = matched_inputs if exact_match else input_operations
+        candidate_metadata = [operation_source_metadata(op) for op in candidates]
+        for key in SYSTEM_SOURCE_FIELDS:
+            merged_op.memory_fields.pop(key, None)
+        merged_op.source = None
+        merged_op.sources = [
+            MemoryOperationSource.model_validate(source)
+            for metadata in candidate_metadata
+            for source in metadata.get("source_extractions", [])
+        ]
+        ids = {
+            source_id for metadata in candidate_metadata for source_id in extraction_ids(metadata)
         }
-        if len(matched_ids) == 1:
-            _set_operation_source_extraction_id(merged_op, next(iter(matched_ids)))
-        elif len(matched_ids) > 1:
-            merged_op.memory_fields["source_extraction_ids"] = sorted(matched_ids)
-        elif len(all_source_ids) == 1:
-            _set_operation_source_extraction_id(merged_op, next(iter(all_source_ids)))
-        else:
-            merged_op.memory_fields["source_extraction_ids"] = sorted(all_source_ids)
-
-
-def _set_operation_source_extraction_id(op: ResolvedOperation, extraction_id: str) -> None:
-    op.memory_fields["source_extraction_id"] = extraction_id
-    source = getattr(op, "source", None)
-    if source is None:
-        op.source = MemoryOperationSource(extraction_id=extraction_id)
-    elif not getattr(source, "extraction_id", None):
-        source.extraction_id = extraction_id
+        if ids:
+            merged_op.memory_fields["source_extraction_ids"] = sorted(ids)
+        merged_op.source_ambiguous = bool(ids or merged_op.sources) and (
+            not exact_match
+            or any(metadata.get("source_provenance_ambiguous") for metadata in candidate_metadata)
+        )
+        metadata = operation_source_metadata(merged_op)
+        merged_op.sources = [
+            MemoryOperationSource.model_validate(source)
+            for source in metadata.get("source_extractions", [])
+        ]
+        if len(merged_op.sources) == 1 and not metadata.get("source_provenance_ambiguous"):
+            merged_op.source = merged_op.sources[0]
+        for key in ("source_extraction_id", "source_extraction_ids"):
+            merged_op.memory_fields.pop(key, None)
+            if key in metadata:
+                merged_op.memory_fields[key] = metadata[key]
 
 
 def enforce_merge_group_peer_id(
@@ -1881,25 +1881,11 @@ def _memory_file_matches_scope(file: MemoryFile, *, scope: _MemorySubmitterScope
 
 
 def _operation_source_extraction_ids(op: ResolvedOperation) -> set[str]:
-    fields = dict(getattr(op, "memory_fields", {}) or {})
-    ids = _source_extraction_ids_from_fields(fields)
-    source_id = source_extraction_id_for_operation(op)
-    if source_id:
-        ids.add(source_id)
-    return ids
+    return extraction_ids(operation_source_metadata(op))
 
 
 def _source_extraction_ids_from_fields(fields: dict[str, Any]) -> set[str]:
-    ids: set[str] = set()
-    value = fields.get("source_extraction_id")
-    if value:
-        ids.add(str(value))
-    values = fields.get("source_extraction_ids")
-    if isinstance(values, (list, tuple, set)):
-        ids.update(str(item) for item in values if item)
-    elif values:
-        ids.add(str(values))
-    return ids
+    return extraction_ids(fields)
 
 
 def _request_uri_set(request: MemoryUpdateRequest) -> set[str]:

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking.session.memory.utils.source_metadata import SYSTEM_SOURCE_FIELDS
 from openviking.telemetry import tracer
 from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.exceptions import NotFoundError
@@ -22,11 +23,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_LLM_HIDDEN_MEMORY_FIELDS = {
-    "source_extraction_id",
-    "source_extraction_ids",
-    "last_update_trace_id",
-}
+_LLM_HIDDEN_MEMORY_FIELDS = SYSTEM_SOURCE_FIELDS
 
 
 def memory_maintenance_notice(

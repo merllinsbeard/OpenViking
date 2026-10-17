@@ -41,6 +41,7 @@ from openviking.session.memory.page_id_map import ResponsePageIdAllocator
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import MEMORY_TOOLS_REGISTRY
 from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.utils.source_metadata import SYSTEM_SOURCE_FIELDS
 from openviking.session.memory.utils.uri import generate_uri
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
@@ -789,7 +790,11 @@ class ExtractLoop:
             items = value if isinstance(value, list) else [value]
 
             for item_index, item in enumerate(items):
-                item_dict = dict(item)
+                item_dict = {
+                    key: value
+                    for key, value in dict(item).items()
+                    if key not in SYSTEM_SOURCE_FIELDS
+                }
                 item_dict["memory_type"] = memory_type
                 identity_resolution_skip = None
                 classify_identity_fields = getattr(
