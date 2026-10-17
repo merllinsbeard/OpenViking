@@ -1,4 +1,3 @@
-"""Fault-injection HTTP server, not an OpenViking integration test."""
 
 import json
 import threading
