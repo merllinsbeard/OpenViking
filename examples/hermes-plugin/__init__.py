@@ -1896,15 +1896,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if self._in_cooldown(settings_key):
                 return None
 
+        self._client = None
         self._endpoint, self._api_key, self._account, self._user, self._agent = settings_key
         try:
             client = self._build_client()
         except ImportError:
             logger.warning(_HTTPX_MISSING)
-            self._client = None
             return None
 
-        health_state, health_message = _classify_runtime_openviking_health(client, settings_key[0])
+        try:
+            health_state, health_message = _classify_runtime_openviking_health(client, settings_key[0])
+        except BaseException:
+            self._failed_refresh = (settings_key, time.monotonic())
+            raise
         if health_state == "healthy":
             if managed and not quick_local.server_belongs_to_profile(paths, settings_key[0]):
                 self._failed_refresh = (settings_key, time.monotonic())
