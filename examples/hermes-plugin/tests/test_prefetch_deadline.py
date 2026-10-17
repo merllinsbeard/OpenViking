@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-import yaml
+from hermes_cli.config import yaml
 
 
 @contextmanager
