@@ -16,15 +16,12 @@ from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
 from openviking.session.memory.utils.language import resolve_output_language_from_text
+from openviking.session.memory.utils.source_metadata import SYSTEM_SOURCE_FIELDS
 
 if TYPE_CHECKING:
     from openviking.config.vlm import VLMHandle
 
-_SYSTEM_HIDDEN_FIELDS = {
-    "source_extraction_id",
-    "source_extraction_ids",
-    "last_update_trace_id",
-}
+_SYSTEM_HIDDEN_FIELDS = SYSTEM_SOURCE_FIELDS
 _MAX_EXTRA_CANDIDATE_FILES = 10
 _PATCH_METADATA_KEYS = ("confidence",)
 
