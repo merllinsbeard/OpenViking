@@ -15,15 +15,18 @@ from openviking.session.memory.dataclass import (
     MemoryTypeSchema,
     ResolvedOperation,
 )
+from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
     create_extraction_output_protocol,
 )
+from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.memory_updater import ExtractContext, MemoryUpdater
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.patch_merge_context_provider import (
+    PatchMergeContextProvider,
     PatchMergePatch,
     _render_field_diff_patches,
 )
@@ -129,10 +132,16 @@ def test_chunk_round_trip_preserves_supplied_message_fields():
 
 def test_chunk_does_not_invent_missing_message_metadata():
     context = ExtractContext(
-        [Message(id="msg-unknown", role="user", parts=[TextPart("A" * 110 + ". " + "B" * 110 + ".")])]
+        [
+            Message(
+                id="msg-unknown", role="user", parts=[TextPart("A" * 110 + ". " + "B" * 110 + ".")]
+            )
+        ]
     )
     assert len(context.messages) == 2
-    assert [(m.turn_id, m.message_kind, m.source_message_ids, m.created_at) for m in context.messages] == [
+    assert [
+        (m.turn_id, m.message_kind, m.source_message_ids, m.created_at) for m in context.messages
+    ] == [
         (None, None, None, None),
         (None, None, None, None),
     ]
@@ -144,7 +153,9 @@ async def test_exact_merge_serializes_full_sources(schema, sources):
     _inherit_source_metadata_to_merged_operations(
         [*(operation(s) for s in sources), operation(B, uri=RENAMED)], [merged]
     )
-    after = await render_operation_after_file(merged, schema=schema, extract_context=ExtractContext([]))
+    after = await render_operation_after_file(
+        merged, schema=schema, extract_context=ExtractContext([])
+    )
     fields = MemoryFileUtils.read(MemoryFileUtils.write(after)).extra_fields
     expected = [A] if sources == [A] else [A, B]
     assert fields["source_extractions"] == expected
@@ -160,7 +171,9 @@ async def test_exact_merge_serializes_full_sources(schema, sources):
 async def test_unmatched_merge_keeps_candidate_scope(schema, sources):
     merged = operation(uri=RENAMED)
     _inherit_source_metadata_to_merged_operations([operation(s) for s in sources], [merged])
-    after = await render_operation_after_file(merged, schema=schema, extract_context=ExtractContext([]))
+    after = await render_operation_after_file(
+        merged, schema=schema, extract_context=ExtractContext([])
+    )
     assert after.extra_fields["source_extractions"] == sources
     assert after.extra_fields["source_provenance_ambiguous"] is True
 
@@ -170,9 +183,36 @@ async def test_legacy_id_never_fabricates_source_details(schema):
     _inherit_source_metadata_to_merged_operations(
         [operation(source_extraction_id="legacy-only")], [merged]
     )
-    after = await render_operation_after_file(merged, schema=schema, extract_context=ExtractContext([]))
+    after = await render_operation_after_file(
+        merged, schema=schema, extract_context=ExtractContext([])
+    )
     assert after.extra_fields["source_extraction_id"] == "legacy-only"
     assert after.extra_fields.get("source_extractions", []) == []
+    assert after.extra_fields["source_provenance_ambiguous"] is True
+
+
+async def test_mixed_legacy_and_full_sources_survive_a_second_merge(schema):
+    legacy = operation(source_extraction_id="legacy-only")
+    first = operation(uri=RENAMED)
+    _inherit_source_metadata_to_merged_operations([legacy, operation(A)], [first])
+    second = operation(uri=RENAMED)
+    _inherit_source_metadata_to_merged_operations([first], [second])
+    after = await render_operation_after_file(
+        second, schema=schema, extract_context=ExtractContext([])
+    )
+    assert after.extra_fields["source_extractions"] == [A]
+    assert after.extra_fields["source_extraction_ids"] == ["extract-a", "legacy-only"]
+    assert after.extra_fields["source_provenance_ambiguous"] is True
+
+
+async def test_partly_unmatched_output_remains_ambiguous(schema):
+    merged = operation()
+    merged.uris.append(RENAMED)
+    _inherit_source_metadata_to_merged_operations([operation(A)], [merged])
+    after = await render_operation_after_file(
+        merged, schema=schema, extract_context=ExtractContext([])
+    )
+    assert after.extra_fields["source_extractions"] == [A]
     assert after.extra_fields["source_provenance_ambiguous"] is True
 
 
@@ -182,7 +222,9 @@ async def test_conflicting_same_id_retains_both_snapshots(schema):
     for inputs in ([A, conflicting, A], [conflicting, A, conflicting]):
         merged = operation()
         _inherit_source_metadata_to_merged_operations([operation(s) for s in inputs], [merged])
-        after = await render_operation_after_file(merged, schema=schema, extract_context=ExtractContext([]))
+        after = await render_operation_after_file(
+            merged, schema=schema, extract_context=ExtractContext([])
+        )
         outputs.append(after.extra_fields)
     assert outputs[0] == outputs[1]
     assert outputs[0]["source_extractions"] == [A, conflicting]
@@ -271,9 +313,85 @@ async def test_system_sources_are_hidden_and_cannot_be_forged(native_target, sch
     )
     assert error is None
     assert parsed.notes[0].model_dump(exclude_none=True) == {
-        "page_id": 1, "name": "topic", "content": "Safe text."
+        "page_id": 1,
+        "name": "topic",
+        "content": "Safe text.",
     }
-    await updater._apply_upsert(operation(B, content=parsed.notes[0].content), ctx)
+    provider = PatchMergeContextProvider(
+        memory_type="notes", patches=[], memory_registry=updater._registry
+    )
+    provider.read_file_contents.update(tool_ctx.read_file_contents)
+    extract_context = provider.get_extract_context()
+    extract_context.page_id_map = page_ids
+    loop = ExtractLoop(
+        vlm=None,
+        model="unused",
+        viking_fs=fs,
+        ctx=ctx,
+        context_provider=provider,
+        isolation_handler=MemoryIsolationHandler(ctx, extract_context),
+    )
+    loop._extract_context = extract_context
+    resolved, links = await loop.resolve_operations(parsed)
+    assert resolved.errors == []
+    assert links == []
+    assert resolved.upsert_operations[0].uris == [URI]
+    _inherit_source_metadata_to_merged_operations([operation(B)], resolved.upsert_operations)
+    await updater._apply_upsert(resolved.upsert_operations[0], ctx)
     stored = MemoryFileUtils.read(await fs.read_file(URI, ctx=ctx))
     assert stored.extra_fields["source_extractions"] == [A, B]
     assert stored.extra_fields["source_provenance_ambiguous"] is True
+
+
+@pytest.mark.parametrize("protocol_name", ["python", "json"])
+async def test_model_cannot_supply_system_fields_even_when_schema_lists_them(
+    native_target, schema, protocol_name
+):
+    fs, ctx, updater = native_target
+    schema.fields.append(
+        MemoryField(
+            name="source_extraction_id", field_type=FieldType.STRING, merge_op=MergeOp.REPLACE
+        )
+    )
+    provider = PatchMergeContextProvider(
+        memory_type="notes", patches=[], memory_registry=updater._registry
+    )
+    extract_context = provider.get_extract_context()
+    protocol = create_extraction_output_protocol(protocol_name)
+    context = ExtractionOutputContext(
+        operations_model=SchemaModelGenerator([schema]).create_structured_operations_model(),
+        schemas=(schema,),
+        page_id_map=extract_context.page_id_map,
+        read_file_contents={},
+        link_enabled=False,
+    )
+    program = (
+        'sdk.create_notes(name="topic", content="Safe text.", source_extraction_id="forged")'
+        if protocol_name == "python"
+        else '{"notes": [{"page_id": 100, "name": "topic", "content": "Safe text.", '
+        '"source_extraction_id": "forged"}]}'
+    )
+    parsed, error = protocol.parse(program, context)
+    assert error is None
+    loop = ExtractLoop(
+        vlm=None,
+        model="unused",
+        viking_fs=fs,
+        ctx=ctx,
+        context_provider=provider,
+        isolation_handler=MemoryIsolationHandler(ctx, extract_context),
+    )
+    loop._extract_context = extract_context
+    resolved, _ = await loop.resolve_operations(parsed)
+    assert resolved.errors == []
+    assert resolved.upsert_operations[0].memory_fields == {
+        "name": "topic",
+        "content": "Safe text.",
+        "memory_type": "notes",
+        "user_id": "default",
+    }
+    _inherit_source_metadata_to_merged_operations([operation(B)], resolved.upsert_operations)
+    await updater._apply_upsert(resolved.upsert_operations[0], ctx)
+    stored = MemoryFileUtils.read(await fs.read_file(URI, ctx=ctx))
+    assert stored.extra_fields["source_extraction_id"] == "extract-b"
+    assert stored.extra_fields["source_extractions"] == [B]
