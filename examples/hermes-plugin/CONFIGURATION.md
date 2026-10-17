@@ -312,7 +312,10 @@ memory:
 | `context` | Native `search/search` with `mode=context`, `query_expansion=off` and `rewrite=false`. Unsupported context requests fall back to scoped `find`. |
 
 Explicit `find` and `context` modes take precedence over `recall_compress`.
-They retain the same identity, sender scope, ranking and source URI handling.
+They retain the existing identity, sender scope and source URI handling.
+Context mode gives native assembly a token budget of
+`recall_max_injected_chars // 4`, bounded to 64–32000 tokens. `recall_limit`
+limits list/find selection, rather than the number of assembled context entries.
 Embeddings can still use the server's embedding provider. They do not run a
 local compressor. `recall_context_mode` is not a supported setting.
 
@@ -331,7 +334,8 @@ The server digest takes precedence over the original search results, and `no_rel
 adds no memory to the prompt. The default is `off`. No local compressor is started.
 
 The Hermes config equivalent is `memory.openviking.recall_compress: server`.
-When enabled, the default request timeout and total recall budget become 55 seconds.
+In `auto` mode, compression gives the default request timeout and total recall
+budget 55 seconds.
 Explicit recall timeout settings still take precedence. Older servers fall back
 to the existing search path within that deadline.
 
