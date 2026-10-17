@@ -10,6 +10,7 @@ The interactive setup wizard lives in ``_setup.py``.
 from __future__ import annotations
 
 import atexit
+import asyncio
 import errno
 import hashlib
 import json
@@ -110,6 +111,8 @@ _CONFIG_SCHEMA = [
     _cfg_field("commit_token_threshold", "Pending session tokens that trigger a background memory commit",
                type="integer", minimum=1000, maximum=1000000, default=20000),
     _cfg_field("recall_limit", "Maximum memories injected by automatic recall", type="integer", minimum=1, maximum=100, default=6),
+    _cfg_field("recall_mode", "Automatic recall route: auto, direct find, or context without generation",
+               type="string", choices=["auto", "find", "context"], default="auto"),
     _cfg_field("recall_score_threshold", "Minimum relevance score for automatic recall", type="number", minimum=0.0, maximum=1.0, step=0.01, default=0.15),
     _cfg_field("recall_max_injected_chars", "Maximum total characters injected by recall", type="integer", minimum=100, maximum=50000, default=4000),
     _cfg_field("profile_token_budget", "Maximum session-start memory tokens injected", type="integer", minimum=500, maximum=50000, default=6000),
@@ -163,6 +166,21 @@ _LEGACY_RECOVERY_LOCK_FILENAME = "legacy-recovery.lock"
 _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
 _INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
 _INVALID_SETTING_WARNINGS_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _RecallBudget:
+    deadline: float
+    request_timeout: float
+
+    def remaining(self, timeout: Optional[float] = None) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= _RECALL_MIN_TIMEOUT_SECONDS:
+            raise TimeoutError("OpenViking recall budget exhausted")
+        return min(remaining, self.request_timeout, timeout if timeout is not None else self.request_timeout)
+
+
+_recall_budget: ContextVar[Optional[_RecallBudget]] = ContextVar("openviking_recall_budget", default=None)
 
 
 def _gateway_peer_id(platform: str, sender: Any) -> str:
@@ -360,8 +378,24 @@ class _VikingClient:
 
     def _request(self, method: str, path: str, kwargs: dict) -> dict:
         timeout = kwargs.pop("timeout", _TIMEOUT)
-        fn = getattr(self._httpx, method)
-        return self._send_with_trusted_identity_retry(lambda headers: fn(f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs))
+        return self._send_with_trusted_identity_retry(
+            lambda headers: self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+        )
+
+    def _http_request(self, method: str, path: str, *, headers: dict, timeout: float, **kwargs):
+        budget = _recall_budget.get()
+        if budget is None:
+            return getattr(self._httpx, method)(f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
+
+        async def request():
+            async with self._httpx.AsyncClient() as client:
+                return await client.request(method, f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
+
+        async def bounded_request():
+            remaining = budget.remaining(timeout)
+            return await asyncio.wait_for(request(), timeout=remaining)
+
+        return asyncio.run(bounded_request())
 
     def get(self, path: str, **kwargs) -> dict:
         return self._request("get", path, kwargs)
@@ -392,7 +426,7 @@ class _VikingClient:
 
     def _anonymous_json(self, path: str) -> dict:
         """Probe server identity without disclosing credentials or tenant IDs."""
-        return self._parse_response(self._httpx.get(f"{self._endpoint}{path}", headers={"Accept": "application/json"}, timeout=3.0))
+        return self._parse_response(self._http_request("get", path, headers={"Accept": "application/json"}, timeout=3.0))
 
     def health_payload(self) -> dict:
         """``GET /health``, anonymous first so credentials never reach an unknown host.
@@ -407,7 +441,7 @@ class _VikingClient:
         except _OpenVikingHTTPError as exc:
             if not self._api_key or _status_code_from_error(exc) not in {401, 403}:
                 raise
-            return self._parse_response(self._httpx.get(f"{self._endpoint}/health", headers=self._headers(include_tenant=False), timeout=3.0))
+            return self._parse_response(self._http_request("get", "/health", headers=self._headers(include_tenant=False), timeout=3.0))
 
     def openapi_payload(self) -> dict:
         return self._anonymous_json("/openapi.json")
@@ -740,7 +774,9 @@ def _probe_openviking_identity(client: _VikingClient) -> tuple[str, Any]:
     try:
         info = client.openapi_payload().get("info")
         verified = isinstance(info, dict) and info.get("title") == "OpenViking API"
-    except Exception:
+    except Exception as exc:
+        if _recall_budget.get() is not None and _is_timeout_error(exc):
+            raise
         logger.debug("Legacy OpenViking OpenAPI identity probe failed", exc_info=True)
         verified = False
     return ("legacy" if verified else "legacy-unverified"), health
@@ -1212,8 +1248,9 @@ def _classify_runtime_openviking_health(client: _VikingClient, endpoint: str) ->
             return ("healthy", "") if not message else ("responded", message + _local_listener_suffix(endpoint))
     except _OpenVikingHTTPError as e:
         return "responded", f"{subject} responded with {_format_openviking_exception(e)}.{_local_listener_suffix(endpoint)}"
-    except Exception:
-        pass
+    except Exception as exc:
+        if _recall_budget.get() is not None and _is_timeout_error(exc):
+            raise
     return "unreachable", ""
 
 
@@ -1769,11 +1806,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """
         if not self._env_refresh_enabled:
             return self._client  # no baseline yet: keep whatever the caller wired up
-        with self._client_refresh_lock:
+        budget = _recall_budget.get()
+        acquired = self._client_refresh_lock.acquire(timeout=budget.remaining()) if budget else self._client_refresh_lock.acquire()
+        if not acquired:
+            raise TimeoutError("OpenViking client refresh budget exhausted")
+        try:
             return self._ensure_client_locked(
                 status_callback=self._runtime_status_callback,
                 warning_callback=self._runtime_warning_callback,
             )
+        finally:
+            self._client_refresh_lock.release()
 
     def _profile_config_and_env(self) -> tuple[dict, Optional[dict]]:
         home = self._hermes_home if self._hermes_home_bound else None
@@ -1924,13 +1967,22 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Session-start memory block (once per session) + query recall."""
+        started = time.monotonic()
+        cfg = self._recall_config()
+        token = _recall_budget.set(_RecallBudget(started + cfg["timeout_seconds"], cfg["request_timeout_seconds"]))
+        parts = []
         query_text = _derive_openviking_user_text(query).strip()
-        if not self._ensure_client():
-            return ""
-        effective_session_id = str(session_id or self._session_id or "").strip()
-        parts = [self._session_start_memory_context(effective_session_id)]
-        if len(query_text) >= _RECALL_QUERY_MIN_CHARS:
-            parts.append(self._search_prefetch_context(query_text, session_id=effective_session_id))
+        try:
+            if not self._ensure_client():
+                return ""
+            effective_session_id = str(session_id or self._session_id or "").strip()
+            parts.append(self._session_start_memory_context(effective_session_id))
+            if len(query_text) >= _RECALL_QUERY_MIN_CHARS:
+                parts.append(self._search_prefetch_context(query_text, session_id=effective_session_id))
+        except TimeoutError:
+            logger.warning("OpenViking prefetch budget exhausted; retaining completed context")
+        finally:
+            _recall_budget.reset(token)
         parts = [p for p in parts if p]
         return "## OpenViking Context\n" + "\n\n".join(parts) if parts else ""
 
@@ -1940,6 +1992,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _remaining_recall_timeout(deadline: float, per_request_timeout: float) -> float:
+        budget = _recall_budget.get()
+        if budget is not None:
+            deadline = min(deadline, budget.deadline)
         remaining = deadline - time.monotonic()
         if remaining <= _RECALL_MIN_TIMEOUT_SECONDS:
             raise TimeoutError("OpenViking recall budget exhausted")
@@ -1957,9 +2012,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
             try:
                 return client.post("/api/v1/search/search", {**base_payload, "session_id": session_id},
                                    timeout=cls._remaining_recall_timeout(deadline, request_timeout))
-            except TimeoutError:
-                raise
             except Exception as e:
+                if _is_timeout_error(e):
+                    raise
                 logger.debug("OpenViking session-aware prefetch failed, falling back to search/find: %s", e)
         return client.post("/api/v1/search/find", base_payload, timeout=cls._remaining_recall_timeout(deadline, request_timeout))
 
@@ -2009,7 +2064,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         target_uri.append(f"{user_root}/peers/{sender_peer}/resources")
             # Without an actor, context-mode resource defaults include peers.
             # Use scoped list recall for that case, even with compression on.
-            if cfg["compress"] in ("server", "auto") and (scope != "peer" or sender_peer):
+            if (cfg["mode"] == "context" or (cfg["mode"] == "auto" and cfg["compress"] in ("server", "auto"))) and (scope != "peer" or sender_peer):
                 payload = {
                     "query": query_text,
                     "mode": "context",
@@ -2021,6 +2076,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 }
                 if session_id:
                     payload["session_id"] = session_id
+                if cfg["mode"] == "context":
+                    payload.update(query_expansion="off", rewrite=False)
                 if scope in ("shared", "peer"):
                     payload["peer_scope"] = "actor" if scope == "peer" else "all"
                 try:
@@ -2045,9 +2102,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         return str(
                             assembled.get("digest") or assembled.get("rendered") or ""
                         ).strip()
-                except TimeoutError:
-                    raise
                 except Exception as e:
+                    if _is_timeout_error(e):
+                        raise
                     logger.debug(
                         "OpenViking context rewrite unavailable, falling back to search: %s", e
                     )
@@ -2055,7 +2112,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 self._post_prefetch_search(
                     client,
                     query_text,
-                    session_id,
+                    session_id if cfg["mode"] == "auto" else "",
                     limit=max(cfg["limit"] * 4, 20),
                     context_type=["memory", "resource"] if cfg["resources"] else "memory",
                     deadline=deadline,
@@ -2141,7 +2198,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         resolved = {
             key.removeprefix("recall_"): self._setting(key, cfg, env=env) for key in _RECALL_SETTING_KEYS
         }
-        if resolved["compress"] in ("server", "auto"):
+        if resolved["mode"] == "auto" and resolved["compress"] in ("server", "auto"):
             # Retrieval plus server rewrite has a longer fuse. Keep explicit
             # user deadlines authoritative and the default off path unchanged.
             for key in ("recall_timeout_seconds", "recall_request_timeout_seconds"):

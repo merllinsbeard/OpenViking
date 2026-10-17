@@ -280,6 +280,45 @@ strings or fragments. Use OpenViking's MCP, CLI, or admin APIs for broader
 resource and directory cleanup.
 
 
+### Recall within a host deadline
+
+The total recall timeout covers connection refresh, the session-start profile,
+query retrieval, full reads and identity retries together. Each HTTP operation
+also has a wall-clock request timeout. Expiry cancels its async HTTP operation
+and closes the connection. A timed-out search does not start a fallback request.
+Completed context is retained. Capture, commits and explicit tools keep their
+existing timeouts and lifecycle.
+
+Choose a retrieval route in the active profile:
+
+```yaml
+memory:
+  openviking:
+    recall_mode: find
+    recall_timeout_seconds: 7
+    recall_request_timeout_seconds: 3
+    recall_resources: true
+```
+
+`OPENVIKING_RECALL_MODE` overrides the YAML value. Supported modes are:
+
+| Mode | Route |
+|------|-------|
+| `auto` | Existing session-aware search and optional compression. This is the default. |
+| `find` | Native text `search/find`, without a session query planner or rewrite. |
+| `context` | Native `search/search` with `mode=context`, `query_expansion=off` and `rewrite=false`. Unsupported context requests fall back to scoped `find`. |
+
+Explicit `find` and `context` modes take precedence over `recall_compress`.
+They retain the same identity, sender scope, ranking and source URI handling.
+Embeddings can still use the server's embedding provider. They do not run a
+local compressor. `recall_context_mode` is not a supported setting.
+
+Hermes's external-provider wait defaults to eight seconds on the tested host.
+Keep the provider's total timeout below the host's wait. The example leaves
+one second for local scheduling and assembly. It cannot guarantee delivery
+when the server or embedding service cannot finish within the remaining budget.
+Quick Local installation and initial provider setup are separate from prefetch.
+
 ### Cloud recall compression
 
 Set `OPENVIKING_RECALL_COMPRESS=server` to enable cloud recall compression, or
