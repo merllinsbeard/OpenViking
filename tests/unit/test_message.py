@@ -371,7 +371,6 @@ class TestMessageInit:
         assert msg.id == "msg-123"
         assert msg.role == "user"
         assert len(msg.parts) == 1
-        # Note: created_at defaults to None; to_dict() generates timestamp if None
         assert msg.created_at is None
 
     def test_with_created_at(self):

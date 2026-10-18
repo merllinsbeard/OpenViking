@@ -23,7 +23,7 @@ class Message:
     role: Literal["user", "assistant"]
     parts: List[Part]
     peer_id: Optional[str] = None
-    created_at: str = None
+    created_at: Optional[str | datetime] = None
     turn_id: Optional[str] = None
     message_kind: Optional[
         Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
@@ -73,7 +73,7 @@ class Message:
 
     def to_dict(self) -> dict:
         """Serialize to JSONL."""
-        created_at_val = self.created_at or datetime.now(timezone.utc).isoformat()
+        created_at_val = self.created_at
         if isinstance(created_at_val, datetime):
             created_at_val = (
                 created_at_val.astimezone(timezone.utc)
