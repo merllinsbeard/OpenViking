@@ -162,6 +162,144 @@ test("conflicting scalars stay absent after response replay and completed-tool d
   assert.equal(turns[1].parts[0].tool_output, "project root");
 });
 
+function completedGroups() {
+  return [
+    { timestamp: "2026-10-17T23:48:12.123456+05:30", type: "event_msg", payload: {
+      type: "item_completed", item: {
+        type: "CommandExecution", id: "same-id", command: "pwd", aggregated_output: "command result", status: "completed",
+        source_message_ids: ["command-ref"], turn_id: "command-turn", message_kind: "assistant_step",
+      },
+    } },
+    { timestamp: "2026-10-18T00:00:00Z", type: "event_msg", payload: {
+      type: "item_completed", item: {
+        type: "DynamicToolCall", id: "same-id", tool: "exec_command", arguments: { cmd: "pwd" },
+        content_items: [{ type: "inputText", text: "dynamic result" }], status: "completed",
+        source_message_ids: ["dynamic-ref"], turn_id: "dynamic-turn", message_kind: "tool_transport",
+      },
+    } },
+  ];
+}
+
+const separateGroupSources = [
+  { created_at: "2026-10-17T23:48:12.123456+05:30", turn_id: "command-turn", message_kind: "assistant_step", source_message_ids: ["command-ref", "same-id"] },
+  { created_at: "2026-10-17T23:48:12.123456+05:30", turn_id: "command-turn", message_kind: "assistant_step", source_message_ids: ["command-ref", "same-id"] },
+  { created_at: "2026-10-18T00:00:00Z", turn_id: "dynamic-turn", message_kind: "tool_transport", source_message_ids: ["dynamic-ref", "same-id"] },
+  { created_at: "2026-10-18T00:00:00Z", turn_id: "dynamic-turn", message_kind: "tool_transport", source_message_ids: ["dynamic-ref", "same-id"] },
+];
+
+function sourceFields(turn) {
+  return Object.fromEntries(["created_at", "turn_id", "message_kind", "source_message_ids"]
+    .filter((field) => turn[field] !== undefined).map((field) => [field, turn[field]]));
+}
+
+test("keeps independent sources for completed groups with the same id and name across kinds", () => {
+  const { turns, excludedLegacyTurnIndices } = extractCaptureTranscript(completedGroups(), cfg);
+  assert.deepEqual(turns.map(sourceFields), separateGroupSources);
+  assert.deepEqual(turns.map((turn) => turn.parts), [
+    [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "running", tool_input: { command: "pwd" } }],
+    [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "completed", tool_output: "command result" }],
+    [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "running", tool_input: { cmd: "pwd" } }],
+    [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "completed", tool_output: '[{"type":"inputText","text":"dynamic result"}]' }],
+  ]);
+  assert.deepEqual(excludedLegacyTurnIndices, []);
+});
+
+for (const name of [undefined, "exec_command"]) {
+  test(`does not attach a ${name ? "named" : "nameless"} response to multiple completed kinds`, () => {
+    const turns = extractCaptureTurns([
+      { timestamp: "2026-10-18T00:00:01Z", type: "response_item", payload: {
+        type: "function_call_output", call_id: "same-id", id: "ambiguous-response", name, output: "response result",
+        turn_id: "response-turn", message_kind: "checkpoint", source_message_ids: ["response-ref"],
+      } },
+      ...completedGroups(),
+    ], cfg);
+    assert.deepEqual(turns.map(sourceFields), separateGroupSources);
+  });
+}
+
+test("attaches response sources only to the unique full group among names and keeps completed duplicates", () => {
+  const groups = completedGroups();
+  groups[1].payload.item.tool = "read_file";
+  const turns = extractCaptureTurns([
+    { timestamp: "2026-10-17T23:48:12.123456+05:30", type: "response_item", payload: {
+      type: "function_call_output", call_id: "same-id", id: "named-response", name: "exec_command", output: "old result",
+      turn_id: "command-turn", message_kind: "assistant_step", source_message_ids: ["response-ref"],
+    } },
+    ...groups,
+    { type: "event_msg", payload: {
+      type: "exec_command_end", call_id: "same-id", command: "old command", aggregated_output: "old result",
+      source_message_ids: ["command-duplicate"],
+    } },
+  ], cfg);
+  assert.deepEqual(turns.map(sourceFields), [
+    { created_at: "2026-10-17T23:48:12.123456+05:30", turn_id: "command-turn", message_kind: "assistant_step", source_message_ids: ["command-ref", "same-id", "command-duplicate", "response-ref", "named-response"] },
+    { created_at: "2026-10-17T23:48:12.123456+05:30", turn_id: "command-turn", message_kind: "assistant_step", source_message_ids: ["command-ref", "same-id", "command-duplicate", "response-ref", "named-response"] },
+    { created_at: "2026-10-18T00:00:00Z", turn_id: "dynamic-turn", message_kind: "tool_transport", source_message_ids: ["dynamic-ref", "same-id"] },
+    { created_at: "2026-10-18T00:00:00Z", turn_id: "dynamic-turn", message_kind: "tool_transport", source_message_ids: ["dynamic-ref", "same-id"] },
+  ]);
+  assert.deepEqual(turns.map((turn) => turn.parts[0].tool_name), ["exec_command", "read_file", "read_file", "read_file"]);
+  assert.equal(turns[1].parts[0].tool_output, "command result");
+});
+
+test("catchUpTurns keeps separate group payloads and retries only the unsent suffix with MOCK HTTP", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "ov-codex-source-groups-"));
+  const previous = process.env.OPENVIKING_CODEX_STATE_DIR;
+  process.env.OPENVIKING_CODEX_STATE_DIR = stateDir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.OPENVIKING_CODEX_STATE_DIR;
+    else process.env.OPENVIKING_CODEX_STATE_DIR = previous;
+    await rm(stateDir, { recursive: true, force: true });
+  });
+  const expected = [
+    { role: "assistant", parts: [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "running", tool_input: { command: "pwd" } }], ...separateGroupSources[0] },
+    { role: "user", parts: [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "completed", tool_output: "command result" }], ...separateGroupSources[1] },
+    { role: "assistant", parts: [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "running", tool_input: { cmd: "pwd" } }], ...separateGroupSources[2] },
+    { role: "user", parts: [{ type: "tool", tool_id: "same-id", tool_name: "exec_command", tool_status: "completed", tool_output: '[{"type":"inputText","text":"dynamic result"}]' }], ...separateGroupSources[3] },
+  ];
+  for (const serial of [false, true]) {
+    const id = `groups-${serial}`;
+    const transcriptPath = join(stateDir, `${id}.jsonl`);
+    await writeFile(transcriptPath, [
+      { type: "response_item", timestamp: "2026-10-18T00:00:01Z", payload: {
+        type: "function_call_output", call_id: "same-id", id: "unattributed", name: "exec_command", output: "response result",
+      } },
+      ...completedGroups(),
+    ].map(JSON.stringify).join("\n"));
+    const state = await loadState(id);
+    assert.equal(state.capturedTurnCount, 0);
+    const attempts = [];
+    const sent = [];
+    let failed = false;
+    const fetchJSONRes = async (path, init) => {
+      const body = JSON.parse(init.body);
+      attempts.push({ path, body });
+      if (serial && path.endsWith("/batch")) return { ok: false, status: 404 };
+      if (serial && sent.length === 2 && !failed) {
+        failed = true;
+        return { ok: false, status: 503 };
+      }
+      sent.push(...(body.messages ?? [body]));
+      return { ok: true, status: 200 };
+    };
+    assert.equal((await catchUpTurns({ state, transcriptPath, cfg, fetchJSONRes })).added, serial ? 2 : 4);
+    assert.equal((await loadState(id)).capturedTurnCount, serial ? 2 : 4);
+    if (serial) {
+      const resumed = await loadState(id);
+      assert.equal((await catchUpTurns({ state: resumed, transcriptPath, cfg, fetchJSONRes })).added, 2);
+      assert.deepEqual(attempts[3].body, attempts[5].body);
+    }
+    assert.deepEqual(sent, expected);
+    const count = attempts.length;
+    assert.equal((await loadState(id)).capturedTurnCount, 4);
+    assert.equal((await catchUpTurns({ state: await loadState(id), transcriptPath, cfg, fetchJSONRes })).added, 0);
+    assert.equal(attempts.length, count);
+    await writeFile(transcriptPath, `${await readFile(transcriptPath, "utf8")}\n${JSON.stringify(message("Appended tail", { id: "tail-id" }))}`);
+    assert.equal((await catchUpTurns({ state: await loadState(id), transcriptPath, cfg, fetchJSONRes })).added, 1);
+    assert.equal((await loadState(id)).capturedTurnCount, 5);
+    assert.deepEqual(sent[4], { role: "user", parts: [{ type: "text", text: "Appended tail" }], created_at: "2026-10-17T23:48:12.123456+05:30", source_message_ids: ["tail-id"] });
+  }
+});
+
 test("payload builder preserves source fields in batch and serial fallback without replay", async (t) => {
   const stateDir = await mkdtemp(join(tmpdir(), "ov-codex-source-"));
   const previous = process.env.OPENVIKING_CODEX_STATE_DIR;
