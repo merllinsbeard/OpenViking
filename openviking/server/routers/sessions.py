@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.peer_id import normalize_peer_id
 from openviking.core.uri_validation import validate_request_viking_uri
+from openviking.message.origin import OriginContractMismatch, OriginStatements, _accepted_origin
 from openviking.message.part import Part, TextPart, part_from_dict
 from openviking.server.auth import get_session_request_context
 from openviking.server.dependencies import get_service
@@ -135,7 +136,7 @@ class AddMessageRequest(BaseModel):
     If both are provided, `parts` takes precedence.
     """
 
-    role: str
+    role: Literal["user", "assistant"]
     peer_id: Optional[str] = None
     content: Optional[str] = None
     parts: Optional[List[Dict[str, Any]]] = None
@@ -145,7 +146,17 @@ class AddMessageRequest(BaseModel):
         Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
     ] = None
     source_message_ids: Optional[List[str]] = None
+    origin: Optional[OriginStatements] = None
     telemetry: TelemetryRequest = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_receiver_facts(cls, value):
+        if isinstance(value, dict) and (
+            "receiver" in value or "session_ingest_started_at" in value
+        ):
+            raise ValueError("Receiver facts cannot be supplied by a producer")
+        return value
 
     @field_validator("peer_id")
     @classmethod
@@ -366,8 +377,8 @@ async def get_session(
     result["pending_tokens"] = int(session.meta.pending_tokens or 0)
     result["auto_commit_policy"] = service.sessions.effective_auto_commit_policy(session)
     result.pop("event_search_tags", None)
-    result["memory_extraction_config"] = (
-        service.sessions.effective_memory_extraction_config(session)
+    result["memory_extraction_config"] = service.sessions.effective_memory_extraction_config(
+        session
     )
     return Response(status="ok", result=result)
 
@@ -400,9 +411,7 @@ async def update_session_config(
     from openviking_cli.exceptions import NotFoundError
 
     service = get_service()
-    event_tags = _event_tags_from_extraction_config(
-        request.memory_extraction_config
-    )
+    event_tags = _event_tags_from_extraction_config(request.memory_extraction_config)
     update_auto_commit_policy = "auto_commit_policy" in request.model_fields_set
     auto_commit_policy = (
         request.auto_commit_policy.model_dump(exclude_none=True)
@@ -434,9 +443,9 @@ async def update_session_config(
         )
     except NotFoundError:
         return error_response("NOT_FOUND", f"Session {session_id} not found")
-    return Response(
-        status="ok", result=execution.result, telemetry=execution.telemetry
-    ).model_dump(exclude_none=True)
+    return Response(status="ok", result=execution.result, telemetry=execution.telemetry).model_dump(
+        exclude_none=True
+    )
 
 
 @router.get("/{session_id}/tool-results")
@@ -535,9 +544,7 @@ async def get_session_archive(
     try:
         result = await session.get_session_archive(archive_id)
     except NotFoundError:
-        return error_response(
-            code="NOT_FOUND", message=f"Archive {archive_id} not found"
-        )
+        return error_response(code="NOT_FOUND", message=f"Archive {archive_id} not found")
     return Response(status="ok", result=_to_jsonable(result))
 
 
@@ -748,26 +755,30 @@ async def add_message(
                 "turn_id": request.turn_id,
                 "message_kind": request.message_kind,
                 "source_message_ids": request.source_message_ids,
+                "origin": request.origin,
             }
         ]
         add_many_async = getattr(session, "add_messages_async", None)
         if callable(add_many_async):
-            await add_many_async(specs)
+            msgs = await add_many_async(specs)
         else:
-            session.add_messages(specs)
+            msgs = session.add_messages(specs)
         await service.sessions.maybe_schedule_auto_commit(
             session_id,
             _ctx,
             reason_hint="message_write",
             session=session,
         )
-        return {
+        result: dict[str, Any] = {
             "session_id": session_id,
             "message_count": len(session.messages),
             # Post-write value so a commit policy can decide without a
             # follow-up get_session round trip.
             "pending_tokens": _session_pending_tokens(session),
         }
+        if request.origin is not None:
+            result.update(_origin_readback_result(msgs))
+        return result
 
     execution = await run_operation(
         operation="session.add_message",
@@ -775,6 +786,18 @@ async def add_message(
         fn=_add,
     )
     return Response(status="ok", result=execution.result, telemetry=execution.telemetry)
+
+
+def _origin_readback_result(messages) -> dict[str, Any]:
+    groups: dict[str, int] = {}
+    accepted = []
+    for message in messages:
+        if message.origin is None:
+            raise OriginContractMismatch("Origin receipt requires persisted receiver facts")
+        group = message.origin.receiver.applicability.group_id
+        input_index = groups.setdefault(group, len(groups))
+        accepted.append(_accepted_origin(message, input_index=input_index))
+    return {"origin_readback": "jsonl", "accepted_origins": accepted}
 
 
 @router.post("/{session_id}/messages/batch")
@@ -804,6 +827,7 @@ async def batch_add_messages(
                     "turn_id": msg_request.turn_id,
                     "message_kind": msg_request.message_kind,
                     "source_message_ids": msg_request.source_message_ids,
+                    "origin": msg_request.origin,
                 }
             )
         add_many_async = getattr(session, "add_messages_async", None)
@@ -817,7 +841,7 @@ async def batch_add_messages(
             reason_hint="message_write",
             session=session,
         )
-        return {
+        result: dict[str, Any] = {
             "session_id": session_id,
             "message_count": len(session.messages),
             "added": len(msgs),
@@ -825,6 +849,9 @@ async def batch_add_messages(
             # follow-up get_session round trip.
             "pending_tokens": _session_pending_tokens(session),
         }
+        if any(message.origin is not None for message in request.messages):
+            result.update(_origin_readback_result(msgs))
+        return result
 
     execution = await run_operation(
         operation="session.batch_add_messages",

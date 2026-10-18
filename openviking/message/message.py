@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 
 from openviking.core.peer_id import normalize_peer_id
+from openviking.message.origin import RecordedOrigin, _decode_recorded_origin, _origin_to_dict
 from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart, part_from_dict
 from openviking.utils.token_estimation import estimate_text_tokens
 
@@ -29,6 +30,7 @@ class Message:
         Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
     ] = None
     source_message_ids: Optional[List[str]] = None
+    origin: Optional[RecordedOrigin] = None
 
     @property
     def content(self) -> str:
@@ -94,6 +96,8 @@ class Message:
             data["message_kind"] = self.message_kind
         if self.source_message_ids is not None:
             data["source_message_ids"] = list(self.source_message_ids)
+        if self.origin is not None:
+            data["origin"] = _origin_to_dict(self.origin)
         return data
 
     def _part_to_dict(self, part: Part) -> dict:
@@ -197,6 +201,7 @@ class Message:
             source_message_ids=(
                 list(source_message_ids) if isinstance(source_message_ids, list) else None
             ),
+            origin=_decode_recorded_origin(data.get("origin")),
         )
 
     def to_jsonl(self) -> str:
