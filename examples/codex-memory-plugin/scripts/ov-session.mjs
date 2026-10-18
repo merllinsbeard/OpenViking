@@ -177,6 +177,9 @@ export async function catchUpTurns({
       ? { role: turn.role, parts: turn.parts }
       : { role: turn.role, content: turn.text };
     if (activePeerId) body.peer_id = activePeerId;
+    for (const field of ["created_at", "turn_id", "message_kind", "source_message_ids"]) {
+      if (turn[field] != null) body[field] = turn[field];
+    }
     return body;
   });
 
