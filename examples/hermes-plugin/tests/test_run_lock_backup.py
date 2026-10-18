@@ -1,4 +1,5 @@
 """Real POSIX locks and native archive reads; no server, CLI or network calls."""
+
 import socket
 import zipfile
 
@@ -9,6 +10,7 @@ import pytest
 def deny_network(monkeypatch):
     def denied(*args, **kwargs):
         raise AssertionError("run-lock tests must not connect to a server")
+
     monkeypatch.setattr(socket.socket, "connect", denied)
     monkeypatch.setattr(socket.socket, "connect_ex", denied)
 
@@ -73,10 +75,15 @@ def test_backup_survives_run_lock_release_after_inventory(external_provider, tmp
     provider._release_run_lock()
     errors = []
     with zipfile.ZipFile(output, "w") as archive:
-        backup._write_zip_entries(archive, entries, output,
+        backup._write_zip_entries(
+            archive,
+            entries,
+            output,
             on_db_failure=lambda path: errors.append((path, "database failure")),
             on_error=lambda path, error: errors.append((path, type(error).__name__)),
-            on_progress=lambda _: None, track_bytes=True)
+            on_progress=lambda _: None,
+            track_bytes=True,
+        )
     assert errors == []
     with zipfile.ZipFile(output) as archive:
         assert archive.testzip() is None
