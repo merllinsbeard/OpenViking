@@ -1,11 +1,40 @@
 """Load the plugin through Hermes discovery in isolated profile homes."""
 
+import importlib.util
 import os
 import shutil
 import sys
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture
+def source_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for key in list(os.environ):
+        if key.startswith("OPENVIKING_"):
+            monkeypatch.delenv(key)
+    name = "openviking_source_test"
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parents[1] / "__init__.py",
+        submodule_search_locations=[str(Path(__file__).resolve().parents[1])],
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    provider = module.OpenVikingMemoryProvider()
+    provider._hermes_home = str(tmp_path)
+    provider._hermes_home_bound = True
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n  openviking:\n    use_ovcli_config: false\n", encoding="utf-8"
+    )
+    yield provider, module
+    provider._writes_enabled = False
+    provider.shutdown()
+    for key in list(sys.modules):
+        if key.startswith(name + "."):
+            del sys.modules[key]
 
 
 @pytest.fixture
