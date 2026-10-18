@@ -2716,13 +2716,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _flock_close(lock_file, path: Optional[Path], label: str) -> None:
+        """Release the handle, keeping its inode stable for contenders and backup readers."""
         steps = []
         if lock_file is not None:
             if fcntl is not None:
                 steps.append(("unlock", lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)))
             steps.append(("close", lock_file.close))
-        if path is not None:
-            steps.append(("remove", lambda: path.unlink(missing_ok=True)))
         for verb, step in steps:
             try:
                 step()
@@ -2740,8 +2739,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._run_lock_file = self._flock_open(path)
             self._run_lock_path = path
         except Exception as e:
-            with suppress(Exception):
-                path.unlink(missing_ok=True)
             logger.debug("Could not acquire OpenViking run lock %s: %s", path, e)
 
     def _release_run_lock(self) -> None:
