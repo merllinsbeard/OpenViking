@@ -56,6 +56,14 @@ the gateway after the upgrade. For catalog installations, use
 
 ## Requirements
 
+Capture requires an OpenViking server with native origin v1 and persistent JSONL
+readback. Native Hermes `origin_statements` metadata preserves host-stamped and
+explicit source observations through persistence and replay. Older rows without
+that metadata keep unknown time meaning. The sender checks every acknowledged
+member before advancing upload progress; missing, changed, or uncertain origin
+readback stops the upload without text/serial retry fallback. Gateway sender
+claims remain separate from primary authorship.
+
 - Python 3.11 or newer in the Hermes environment
 - An OpenViking server reachable from Hermes, or OpenViking Service credentials
 - For a self-hosted server, OpenViking installed in its own environment or container
