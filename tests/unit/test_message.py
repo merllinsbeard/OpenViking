@@ -735,6 +735,34 @@ class TestMessageFromDict:
         assert msg.content == "Hello from legacy storage"
         assert msg.created_at is None
 
+    @pytest.mark.parametrize(
+        ("stored_time", "expected_time"),
+        [
+            ({}, None),
+            ({"created_at": None}, None),
+            (
+                {"created_at": "2026-10-17T09:10:11.123456+07:00"},
+                "2026-10-17T09:10:11.123456+07:00",
+            ),
+        ],
+    )
+    def test_legacy_timestamp_survives_repeated_jsonl_roundtrip(self, stored_time, expected_time):
+        msg = Message.from_dict(
+            {"id": "msg-legacy", "role": "user", "content": "Legacy words", **stored_time}
+        )
+        expected = {
+            "id": "msg-legacy",
+            "role": "user",
+            "parts": [{"type": "text", "text": "Legacy words"}],
+            "created_at": expected_time,
+        }
+
+        for _ in range(3):
+            row = json.loads(msg.to_jsonl())
+            assert row == expected
+            msg = Message.from_dict(row)
+            assert msg.created_at == expected_time
+
     def test_roundtrip(self):
         """Test to_dict -> from_dict roundtrip."""
         original = Message(
