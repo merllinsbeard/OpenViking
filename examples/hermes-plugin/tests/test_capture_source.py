@@ -100,7 +100,7 @@ def test_reused_tool_ids_do_not_borrow_unrelated_source_messages(source_provider
 
 
 @pytest.mark.parametrize("route", ["batch", "text", "serial", "retry"])
-def test_public_sync_payloads_survive_upload_routes(source_provider, monkeypatch, tmp_path, route):
+def test_public_sync_payloads_survive_mock_upload_routes(source_provider, monkeypatch, tmp_path, route):
     provider, module = source_provider
     requests = []
     accepted = []
@@ -136,7 +136,10 @@ def test_public_sync_payloads_survive_upload_routes(source_provider, monkeypatch
             {"role": "user", "content": "Old", "message_uid": "excluded-history"},
             {"role": "assistant", "content": "Old reply"},
             {"role": "user", "content": "Input", "timestamp": 0, "platform_message_id": "platform-7"},
-            {"role": "assistant", "content": "Step", "turn_id": "turn-a", "message_kind": "assistant_step"},
+            {"role": "assistant", "tool_calls": [call("one")], "turn_id": "turn-a",
+             "message_kind": "tool_transport", "message_uid": "call-owner"},
+            {"role": "tool", "tool_call_id": "one", "content": "result", "turn_id": "turn-a",
+             "message_kind": "tool_transport", "message_uid": "tool-result"},
             {"role": "assistant", "content": "Reply", "message_uid": "final-reply"},
         ]
         original = copy.deepcopy(source)
@@ -148,8 +151,10 @@ def test_public_sync_payloads_survive_upload_routes(source_provider, monkeypatch
     expected = [
         {"role": "user", "parts": [{"type": "text", "text": "Input"}],
          "created_at": "1970-01-01T00:00:00+00:00", "source_message_ids": ["platform-7"]},
-        {"role": "assistant", "parts": [{"type": "text", "text": "Step"}],
-         "peer_id": "assistant-peer", "turn_id": "turn-a", "message_kind": "assistant_step"},
+        {"role": "assistant", "parts": [{"type": "tool", "tool_id": "one", "tool_name": "shell",
+         "tool_input": {"command": "pwd"}, "tool_status": "completed", "tool_output": "result"}],
+         "peer_id": "assistant-peer", "turn_id": "turn-a", "message_kind": "tool_transport",
+         "source_message_ids": ["call-owner", "tool-result"]},
         {"role": "assistant", "parts": [{"type": "text", "text": "Reply"}],
          "peer_id": "assistant-peer", "source_message_ids": ["final-reply"]},
     ]
@@ -167,3 +172,32 @@ def test_public_sync_payloads_survive_upload_routes(source_provider, monkeypatch
         assert requests[1] == requests[2]
     (tmp_path / "accepted.json").write_text(json.dumps(accepted), encoding="utf-8")
     assert json.loads((tmp_path / "accepted.json").read_text()) == expected
+
+
+def test_unknown_source_fields_stay_absent_beside_known_metadata(source_provider):
+    provider, _ = source_provider
+    assert provider._messages_to_openviking_batch([
+        {"role": "user", "content": "Input", "source_message_ids": [None, 42, ""],
+         "turn_id": 42, "message_kind": None, "message_uid": None, "id": "untyped-id",
+         "platform_message_id": False, "timestamp": None},
+        {"role": "assistant", "content": "Reply", "turn_id": "native-turn"},
+    ]) == [
+        {"role": "user", "parts": [{"type": "text", "text": "Input"}]},
+        {"role": "assistant", "parts": [{"type": "text", "text": "Reply"}], "turn_id": "native-turn"},
+    ]
+
+
+def test_native_redaction_retains_supplied_fields_without_mutating_input(source_provider):
+    from agent.memory_manager import _redact_for_provider
+
+    provider, _ = source_provider
+    message = {"role": "user", "content": "Input", "timestamp": 1.25,
+               "platform_message_id": "platform-42", "message_uid": "durable-7"}
+    original = copy.deepcopy(message)
+    clean = _redact_for_provider([message])
+    assert provider._messages_to_openviking_batch(clean) == [{
+        "role": "user", "parts": [{"type": "text", "text": "Input"}],
+        "created_at": "1970-01-01T00:00:01.250000+00:00",
+        "source_message_ids": ["durable-7", "platform-42"],
+    }]
+    assert message == original
