@@ -140,12 +140,12 @@ func (c *Client) AddMessage(ctx context.Context, sessionID, role string, opts Ad
 		return nil, err
 	}
 	var result map[string]any
-	err := c.doJSON(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/messages", nil, payload, &result)
+	env, err := c.doJSONEnvelope(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/messages", nil, payload, &result)
 	if err != nil && opts.Origin != nil {
 		return nil, &OriginContractMismatch{Reason: err.Error()}
 	}
 	if err == nil {
-		err = validateOriginReadback([]Message{{Role: role, CreatedAt: opts.CreatedAt, TurnID: opts.TurnID, MessageKind: opts.MessageKind, SourceMessageIDs: opts.SourceMessageIDs, Parts: opts.Parts, Origin: opts.Origin}}, result)
+		err = validateOriginReadback([]Message{{Role: role, CreatedAt: opts.CreatedAt, TurnID: opts.TurnID, MessageKind: opts.MessageKind, SourceMessageIDs: opts.SourceMessageIDs, Parts: opts.Parts, Origin: opts.Origin}}, result, env.Result)
 	}
 	if err != nil {
 		return nil, err
@@ -163,7 +163,7 @@ func (c *Client) BatchAddMessages(ctx context.Context, sessionID string, message
 		}
 	}
 	var result map[string]any
-	err := c.doJSON(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/messages/batch", nil, payload, &result)
+	env, err := c.doJSONEnvelope(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/messages/batch", nil, payload, &result)
 	if err != nil {
 		for _, message := range messages {
 			if message.Origin != nil {
@@ -171,7 +171,7 @@ func (c *Client) BatchAddMessages(ctx context.Context, sessionID string, message
 			}
 		}
 	} else {
-		err = validateOriginReadback(messages, result)
+		err = validateOriginReadback(messages, result, env.Result)
 	}
 	if err != nil {
 		return nil, err

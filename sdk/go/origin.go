@@ -266,7 +266,7 @@ func decodeOriginJSON(data []byte, target any) error {
 	return decoder.Decode(target)
 }
 
-func validateOriginReadback(messages []Message, result map[string]any) error {
+func validateOriginReadback(messages []Message, result map[string]any, rawResult json.RawMessage) error {
 	required := false
 	for _, message := range messages {
 		required = required || message.Origin != nil
@@ -278,12 +278,16 @@ func validateOriginReadback(messages []Message, result map[string]any) error {
 	if result["origin_readback"] != "jsonl" {
 		return fail("missing persistent readback")
 	}
-	raw, err := json.Marshal(result["accepted_origins"])
-	if err != nil {
+	// The generic result map uses float64. Read only the origin ACK from the
+	// native raw envelope so IntegerTime keeps all int64 bits before validation.
+	var wireResult struct {
+		AcceptedOrigins json.RawMessage `json:"accepted_origins"`
+	}
+	if err := json.Unmarshal(rawResult, &wireResult); err != nil {
 		return fail(err.Error())
 	}
 	var members []map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &members); err != nil || len(members) == 0 {
+	if err := json.Unmarshal(wireResult.AcceptedOrigins, &members); err != nil || len(members) == 0 {
 		return fail("missing readback members")
 	}
 	seenIDs, seenGroups, stamps := map[string]bool{}, map[string]bool{}, map[string]bool{}

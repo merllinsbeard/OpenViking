@@ -155,7 +155,88 @@ func TestOriginTimeScalarAndReceiverBoundary(t *testing.T) {
 	}
 	message, response := originFixture(t)
 	message.Parts = []map[string]any{{"type": "tool"}, {"type": "tool"}}
-	if err := validateOriginReadback([]Message{message}, response); err == nil {
+	raw, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOriginReadback([]Message{message}, response, raw); err == nil {
 		t.Fatal("accepted incomplete fanout")
+	}
+}
+
+func TestOriginNativeSDKLargeIntegerReadback(t *testing.T) {
+	cases := []struct {
+		name     string
+		sent     int64
+		received int64
+		mismatch bool
+	}{
+		{"exact_above_float53", 9007199254740993, 9007199254740993, false},
+		{"changed_to_lower_neighbor", 9007199254740993, 9007199254740992, true},
+		{"changed_to_upper_neighbor", 9007199254740992, 9007199254740993, true},
+	}
+	for _, batch := range []bool{false, true} {
+		for _, scenario := range cases {
+			t.Run(map[bool]string{false: "single/", true: "batch/"}[batch]+scenario.name, func(t *testing.T) {
+				message, response := originFixture(t)
+				message.Origin.Contributors[0].Times[0].Literal = IntegerTime(scenario.sent)
+				message.Origin.Contributors[0].Times[0].Encoding = "unix_seconds"
+				member := response["accepted_origins"].([]any)[0].(map[string]any)
+				observed := member["origin"].(map[string]any)["contributors"].([]any)[0].(map[string]any)["times"].([]any)[0].(map[string]any)
+				observed["literal"], observed["encoding"] = scenario.received, "unix_seconds"
+				response["pending_tokens"] = 17
+				calls := 0
+				client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var request struct {
+						Origin   *OriginStatements `json:"origin"`
+						Messages []Message         `json:"messages"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					sent := request.Origin
+					if batch {
+						if len(request.Messages) != 1 {
+							t.Errorf("messages=%d", len(request.Messages))
+							return
+						}
+						sent = request.Messages[0].Origin
+					}
+					if sent == nil || len(sent.Contributors) != 1 || len(sent.Contributors[0].Times) != 1 || sent.Contributors[0].Times[0].Literal != IntegerTime(scenario.sent) {
+						t.Errorf("request integer lost precision: %#v", sent)
+					}
+					writeOK(t, w, response)
+				}))
+				defer closeServer()
+				var result map[string]any
+				var err error
+				if batch {
+					result, err = client.BatchAddMessages(context.Background(), "native-v1", []Message{message}, nil)
+				} else {
+					result, err = client.AddMessage(context.Background(), "native-v1", message.Role, AddMessageOptions{Content: message.Content, Parts: message.Parts, CreatedAt: message.CreatedAt, TurnID: message.TurnID, MessageKind: message.MessageKind, SourceMessageIDs: message.SourceMessageIDs, Origin: message.Origin})
+				}
+				if calls != 1 {
+					t.Fatalf("uncertain append retried: calls=%d", calls)
+				}
+				if scenario.mismatch {
+					var mismatch *OriginContractMismatch
+					if !errors.As(err, &mismatch) || result != nil {
+						t.Fatalf("changed integer accepted: result=%#v err=%v", result, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				members, ok := result["accepted_origins"].([]AcceptedOrigin)
+				if !ok || len(members) != 1 || members[0].Origin.Statements.Contributors[0].Times[0].Literal != IntegerTime(9007199254740993) {
+					t.Fatalf("readback integer lost precision: %#v", result)
+				}
+				if result["pending_tokens"] != float64(17) {
+					t.Fatalf("generic result map numeric type changed: %#v", result["pending_tokens"])
+				}
+			})
+		}
 	}
 }
