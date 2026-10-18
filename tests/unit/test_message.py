@@ -349,7 +349,7 @@ class TestPartFromDict:
 
     def test_empty_dict(self):
         """Test empty dict creates empty TextPart."""
-        data = {}
+        data: dict[str, object] = {}
 
         part = part_from_dict(data)
 

@@ -8,7 +8,7 @@ Message = role + parts, supports serialization to JSONL.
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from openviking.core.peer_id import normalize_peer_id
 from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart, part_from_dict
@@ -80,7 +80,7 @@ class Message:
                 .isoformat(timespec="milliseconds")
                 .replace("+00:00", "Z")
             )
-        data = {
+        data: dict[str, Any] = {
             "id": self.id,
             "role": self.role,
             "parts": [self._part_to_dict(p) for p in self.parts],
@@ -185,6 +185,7 @@ class Message:
         except ValueError:
             peer_id = data.get("peer_id")
 
+        source_message_ids = data.get("source_message_ids")
         return cls(
             id=data["id"],
             role=data["role"],
@@ -194,9 +195,7 @@ class Message:
             turn_id=data.get("turn_id"),
             message_kind=data.get("message_kind"),
             source_message_ids=(
-                list(data.get("source_message_ids"))
-                if isinstance(data.get("source_message_ids"), list)
-                else None
+                list(source_message_ids) if isinstance(source_message_ids, list) else None
             ),
         )
 

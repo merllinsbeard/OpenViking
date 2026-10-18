@@ -74,7 +74,11 @@ function stripPlaygroundContextSuffix(text: string): string {
 }
 
 /** Format relative time */
-function formatRelativeTime(iso: string, t: TFunction<'sessions'>): string {
+function formatRelativeTime(
+  iso: string | null,
+  t: TFunction<'sessions'>,
+): string {
+  if (!iso) return ''
   const now = Date.now()
   const then = new Date(iso).getTime()
   const diff = Math.max(0, now - then)
