@@ -60,6 +60,34 @@ This SDK does not implement legacy `agent_id` compatibility.
 
 ## Common Operations
 
+Session messages accept domain `OriginStatements` through `AddMessageOptions.Origin`
+or `Message.Origin` in a batch. Contributors keep separate literal times and
+optional sender/author claims. For example:
+
+```go
+origin := &openviking.OriginStatements{Contributors: []openviking.ContributorStatement{{
+    Locator: openviking.SourceLocator{Provider: "hermes"},
+    Times: []openviking.TimeStatement{{
+        Literal: openviking.IntegerTime(0), Encoding: "unix_seconds", Meaning: "host_stamp",
+        Basis: openviking.FieldBasis{Producer: "hermes", Field: "stamp_message_timestamp"},
+    }},
+}}}
+text := "Forwarded text"
+result, err := client.AddMessage(ctx, "session-A", "user", openviking.AddMessageOptions{
+    Content: &text, Origin: origin,
+})
+if err != nil { return err }
+accepted := result["accepted_origins"].([]openviking.AcceptedOrigin)
+fmt.Println(accepted[0].Origin.Receiver.SessionIngestStartedAt)
+```
+
+The SDK validates JSONL readback before returning success and replaces
+`accepted_origins` with typed values. `OriginContractMismatch` means progress must
+not advance: the server may be incompatible or the append outcome uncertain.
+Do not automatically resubmit an uncertain append. Receiver processing time is
+separate from caller observations; roles do not identify authors, and old missing
+facts remain unknown. Existing calls without origin retain their return conventions.
+
 Imports return a `task_id` by default. Query `client.GetTask(ctx, taskID)` to check progress.
 
 ```go

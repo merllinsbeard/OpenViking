@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
+import { mockOriginReadback, readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -114,7 +114,7 @@ function mockHandler(calls, { commitStatus = 200 } = {}) {
     }
     if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
       call.body = await readRequestBody(req);
-      writeJson(res, { status: "ok", result: { ok: true } });
+      writeJson(res, { status: "ok", result: mockOriginReadback(call.body.messages) });
       return;
     }
     if (req.method === "POST" && url.pathname.endsWith("/commit")) {
@@ -196,7 +196,7 @@ test("session-end migrates a startup-inclusive cursor before catch-up and commit
     assert.deepEqual(sentMessages(calls).map((item) => item.parts?.[0]?.text ?? item.content), ["New question"]);
     assert.equal(calls.filter((call) => call.path.endsWith("/commit")).length, 1);
     const state = await readState(stateDir, "startup-end");
-    assert.equal(state.captureFormatVersion, 2);
+    assert.equal(state.captureFormatVersion, 3);
     assert.equal(state.capturedTurnCount, 2);
   } finally {
     await rm(stateDir, { recursive: true, force: true });
@@ -529,7 +529,7 @@ test("a partial catch-up keeps the live session and the end marker instead of co
         calls[calls.length - 1].body = await readRequestBody(req);
         serial += 1;
         if (serial === 1) {
-          writeJson(res, { status: "ok", result: { ok: true } });
+          writeJson(res, { status: "ok", result: mockOriginReadback([calls[calls.length - 1].body]) });
           return;
         }
         res.writeHead(500, { "Content-Type": "application/json" });

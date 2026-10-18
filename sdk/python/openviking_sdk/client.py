@@ -69,6 +69,7 @@ from .options import (
     UpdateSkillOptions,
     WriteOptions,
 )
+from .origin import OriginContractMismatch, _encode_origin, _validate_origin_readback
 
 ERROR_CODE_TO_EXCEPTION = {
     "INVALID_ARGUMENT": InvalidArgumentError,
@@ -539,6 +540,10 @@ class AsyncHTTPClient:
     @classmethod
     def _normalize_message_payload(cls, message: Mapping[str, Any]) -> Dict[str, Any]:
         payload = dict(message)
+        if "receiver" in payload or "session_ingest_started_at" in payload:
+            raise ValueError("Receiver facts cannot be supplied by a producer")
+        if payload.get("origin") is not None:
+            payload["origin"] = _encode_origin(payload["origin"])
         if payload.get("parts"):
             payload["parts"] = [normalize_part(part) for part in payload["parts"]]
             payload.pop("content", None)
@@ -797,12 +802,20 @@ class AsyncHTTPClient:
             BatchAddMessagesOptions,
             fixed={"messages": normalized_messages},
         )
-        response = await self._request(
-            "POST",
-            f"/api/v1/sessions/{session_path}/messages/batch",
-            json=payload,
-        )
-        return self._handle_response_data(response).get("result", {})
+        try:
+            response = await self._request(
+                "POST",
+                f"/api/v1/sessions/{session_path}/messages/batch",
+                json=payload,
+            )
+            result = self._handle_response_data(response).get("result", {})
+        except (httpx.HTTPError, OpenVikingError, ValueError) as exc:
+            if any(message.get("origin") is not None for message in normalized_messages):
+                raise OriginContractMismatch(
+                    "Origin append was rejected or its outcome is unknown"
+                ) from exc
+            raise
+        return _validate_origin_readback(normalized_messages, result)
 
     async def add_skill(
         self,
@@ -1779,10 +1792,18 @@ class AsyncHTTPClient:
         )
         payload = self._normalize_message_payload(payload)
         session_path = self._path_segment(session_id)
-        response = await self._request(
-            "POST", f"/api/v1/sessions/{session_path}/messages", json=payload
-        )
-        return self._handle_response_data(response).get("result", {})
+        try:
+            response = await self._request(
+                "POST", f"/api/v1/sessions/{session_path}/messages", json=payload
+            )
+            result = self._handle_response_data(response).get("result", {})
+        except (httpx.HTTPError, OpenVikingError, ValueError) as exc:
+            if payload.get("origin") is not None:
+                raise OriginContractMismatch(
+                    "Origin append was rejected or its outcome is unknown"
+                ) from exc
+            raise
+        return _validate_origin_readback([payload], result)
 
     async def export_ovpack(
         self,

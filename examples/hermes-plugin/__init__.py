@@ -9,6 +9,7 @@ The interactive setup wizard lives in ``_setup.py``.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import errno
 import hashlib
@@ -30,20 +31,24 @@ import zipfile
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 
-from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider, spawn_context_thread
+from agent.message_content import flatten_message_text
 from agent.secret_scope import get_secret
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_constants import get_hermes_home, get_process_hermes_home
 from tools.registry import tool_error
 from utils import atomic_json_write, env_var_enabled
+
+from .message_origin import OriginContractMismatch, observed_time, validate_readback
+from .message_origin import statements as _origin_statements
 
 try:
     import fcntl
@@ -108,6 +113,8 @@ _CONFIG_SCHEMA = [
     _cfg_field("commit_token_threshold", "Pending session tokens that trigger a background memory commit",
                type="integer", minimum=1000, maximum=1000000, default=20000),
     _cfg_field("recall_limit", "Maximum memories injected by automatic recall", type="integer", minimum=1, maximum=100, default=6),
+    _cfg_field("recall_mode", "Automatic recall route: auto, direct find, or context without generation",
+               type="string", choices=["auto", "find", "context"], default="auto"),
     _cfg_field("recall_score_threshold", "Minimum relevance score for automatic recall", type="number", minimum=0.0, maximum=1.0, step=0.01, default=0.15),
     _cfg_field("recall_max_injected_chars", "Maximum total characters injected by recall", type="integer", minimum=100, maximum=50000, default=4000),
     _cfg_field("profile_token_budget", "Maximum session-start memory tokens injected", type="integer", minimum=500, maximum=50000, default=6000),
@@ -161,6 +168,48 @@ _LEGACY_RECOVERY_LOCK_FILENAME = "legacy-recovery.lock"
 _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
 _INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
 _INVALID_SETTING_WARNINGS_LOCK = threading.Lock()
+
+
+@dataclass
+class _RecallBudget:
+    deadline: float
+    request_timeout: float
+    runner: asyncio.Runner = field(default_factory=asyncio.Runner, repr=False)
+    client: Any = field(default=None, init=False, repr=False)
+    owner_thread: int = field(default_factory=threading.get_ident, init=False, repr=False)
+
+    def remaining(self, timeout: Optional[float] = None) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= _RECALL_MIN_TIMEOUT_SECONDS:
+            raise TimeoutError("OpenViking recall budget exhausted")
+        return min(remaining, self.request_timeout, timeout if timeout is not None else self.request_timeout)
+
+    def request(self, httpx, method: str, url: str, *, timeout: float, **kwargs):
+        async def request():
+            if self.client is None:
+                self.client = httpx.AsyncClient()
+            return await self.client.request(method, url, timeout=timeout, **kwargs)
+
+        async def bounded_request():
+            remaining = self.remaining(timeout)
+            return await asyncio.wait_for(request(), timeout=remaining)
+
+        return self.runner.run(bounded_request())
+
+    def close(self) -> None:
+        try:
+            if self.client is not None:
+                self.runner.run(self.client.aclose())
+        finally:
+            self.runner.close()
+
+
+_recall_budget: ContextVar[Optional[_RecallBudget]] = ContextVar("openviking_recall_budget", default=None)
+
+
+def _current_recall_budget() -> Optional[_RecallBudget]:
+    budget = _recall_budget.get()
+    return budget if budget is not None and budget.owner_thread == threading.get_ident() else None
 
 
 def _gateway_peer_id(platform: str, sender: Any) -> str:
@@ -358,8 +407,16 @@ class _VikingClient:
 
     def _request(self, method: str, path: str, kwargs: dict) -> dict:
         timeout = kwargs.pop("timeout", _TIMEOUT)
-        fn = getattr(self._httpx, method)
-        return self._send_with_trusted_identity_retry(lambda headers: fn(f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs))
+        return self._send_with_trusted_identity_retry(
+            lambda headers: self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+        )
+
+    def _http_request(self, method: str, path: str, *, headers: dict, timeout: float, **kwargs):
+        budget = _current_recall_budget()
+        if budget is None:
+            return getattr(self._httpx, method)(f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
+
+        return budget.request(self._httpx, method, f"{self._endpoint}{path}", headers=headers, timeout=timeout, **kwargs)
 
     def get(self, path: str, **kwargs) -> dict:
         return self._request("get", path, kwargs)
@@ -390,7 +447,7 @@ class _VikingClient:
 
     def _anonymous_json(self, path: str) -> dict:
         """Probe server identity without disclosing credentials or tenant IDs."""
-        return self._parse_response(self._httpx.get(f"{self._endpoint}{path}", headers={"Accept": "application/json"}, timeout=3.0))
+        return self._parse_response(self._http_request("get", path, headers={"Accept": "application/json"}, timeout=3.0))
 
     def health_payload(self) -> dict:
         """``GET /health``, anonymous first so credentials never reach an unknown host.
@@ -405,7 +462,7 @@ class _VikingClient:
         except _OpenVikingHTTPError as exc:
             if not self._api_key or _status_code_from_error(exc) not in {401, 403}:
                 raise
-            return self._parse_response(self._httpx.get(f"{self._endpoint}/health", headers=self._headers(include_tenant=False), timeout=3.0))
+            return self._parse_response(self._http_request("get", "/health", headers=self._headers(include_tenant=False), timeout=3.0))
 
     def openapi_payload(self) -> dict:
         return self._anonymous_json("/openapi.json")
@@ -738,7 +795,9 @@ def _probe_openviking_identity(client: _VikingClient) -> tuple[str, Any]:
     try:
         info = client.openapi_payload().get("info")
         verified = isinstance(info, dict) and info.get("title") == "OpenViking API"
-    except Exception:
+    except Exception as exc:
+        if _current_recall_budget() is not None and _is_timeout_error(exc):
+            raise
         logger.debug("Legacy OpenViking OpenAPI identity probe failed", exc_info=True)
         verified = False
     return ("legacy" if verified else "legacy-unverified"), health
@@ -1169,13 +1228,13 @@ def _classify_runtime_openviking_health(client: _VikingClient, endpoint: str) ->
             return ("healthy", "") if not message else ("responded", message + _local_listener_suffix(endpoint))
     except _OpenVikingHTTPError as e:
         return "responded", f"{subject} responded with {_format_openviking_exception(e)}.{_local_listener_suffix(endpoint)}"
-    except Exception:
-        pass
+    except Exception as exc:
+        if _current_recall_budget() is not None and _is_timeout_error(exc):
+            raise
     return "unreachable", ""
 
 
 from . import _setup  # noqa: E402  (needs the helpers above at call time)
-
 
 # -- MemoryProvider implementation ------------------------------------------
 
@@ -1266,6 +1325,55 @@ def _index_tool_calls(messages: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[st
     return tool_calls_by_id, completed_tool_ids, skipped_tool_ids
 
 
+def _source_message_metadata(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    metadata: List[Dict[str, Any]] = []
+    source_ids: List[str] = []
+    contributors: List[Dict[str, Any]] = []
+    for message in messages:
+        origin = message.get("origin_statements")
+        if origin is not None:
+            contributors.extend(_origin_statements(origin)["contributors"])
+        else:
+            times = []
+            for name in ("created_at", "timestamp"):
+                literal = message.get(name)
+                if isinstance(literal, bool) or not isinstance(literal, (str, int, float)):
+                    continue
+                if isinstance(literal, float) and not math.isfinite(literal):
+                    continue
+                times.append(observed_time(literal, "unknown", {"producer": "hermes", "field": f"message.{name}"}))
+            refs = []
+            for kind, values in [("host_row", [message.get("message_uid")]), ("source_message", [message.get("platform_message_id")]), ("supplied_ref", message.get("source_message_ids") or [])]:
+                if isinstance(values, list):
+                    refs.extend({"kind": kind, "value": value} for value in values if isinstance(value, str) and value)
+            contributors.append({"locator": {"provider": "hermes", "session_id": message.get("session_id")}, "refs": refs, "times": times, "content_class": "unknown"})
+        absorbed = message.get("_absorbed_message_uids")
+        known_rows = {ref["value"] for item in contributors for ref in item.get("refs", []) if ref.get("kind") == "host_row"}
+        for uid in absorbed if isinstance(absorbed, list) else []:
+            if isinstance(uid, str) and uid and uid not in known_rows:
+                contributors.append({"locator": {"provider": "hermes", "session_id": message.get("session_id")}, "refs": [{"kind": "host_row", "value": uid}], "content_class": "unknown"})
+        supplied = {key: message.get(key) for key in ("created_at", "turn_id", "message_kind")}
+        timestamp = supplied["created_at"] or message.get("timestamp")
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            try:
+                timestamp = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                timestamp = None
+        supplied["created_at"] = timestamp if isinstance(timestamp, str) and timestamp else None
+        metadata.append(supplied)
+        for value in (message.get("source_message_ids"), [message.get("message_uid")],
+                      message.get("_absorbed_message_uids"), [message.get("platform_message_id")]):
+            if isinstance(value, list):
+                source_ids.extend(ref for ref in value if isinstance(ref, str) and ref)
+    shared = {key: value for key, value in metadata[0].items()
+              if isinstance(value, str) and value and all(m[key] == value for m in metadata)}
+    if source_ids:
+        shared["source_message_ids"] = list(dict.fromkeys(source_ids))
+    normalized = _origin_statements({"version": 1, "contributors": contributors})
+    shared["origin"] = {"version": 1, "contributors": list({json.dumps(item, sort_keys=True, ensure_ascii=False, allow_nan=False): item for item in normalized["contributors"]}.values())}
+    return shared
+
+
 @dataclass
 class _CommitScope:
     """One connection generation. Workers retain it across a config reload."""
@@ -1280,8 +1388,7 @@ class _CommitScope:
 
 @dataclass
 class _TurnUpload:
-    """One turn's OpenViking upload: structured batches first, falling back to plain text
-    on a first-batch failure, and to individual messages after a failed retry."""
+    """Advance a turn only after origin readback; retain legacy fallback for unmarked input."""
 
     client: _VikingClient
     sid: str
@@ -1303,8 +1410,14 @@ class _TurnUpload:
             self._trace("POST /api/v1/sessions/%s/messages/batch range=%d:%d payload=%s",
                         self.sid, self.next_index, batch_end, json.dumps(payload, ensure_ascii=False))
             try:
-                client.post(f"/api/v1/sessions/{self.sid}/messages/batch", payload)
+                for message in payload["messages"]:
+                    if message.get("origin") is not None:
+                        _origin_statements(message["origin"])
+                response = client.post(f"/api/v1/sessions/{self.sid}/messages/batch", payload)
+                validate_readback(payload["messages"], response)
             except Exception as batch_error:
+                if any(message.get("origin") is not None for message in payload["messages"]):
+                    raise OriginContractMismatch("Origin append is rejected or unconfirmed") from batch_error
                 if self.next_index:
                     raise
                 logger.warning("OpenViking structured sync failed; falling back to text sync: %s", batch_error)
@@ -1319,14 +1432,23 @@ class _TurnUpload:
         assistant_message: Dict[str, Any] = {"role": "assistant", "parts": [{"type": "text", "text": _message_text(self.assistant_content)[:4000]}]}
         if self.assistant_peer_id:
             assistant_message["peer_id"] = self.assistant_peer_id
-        client.post(f"/api/v1/sessions/{self.sid}/messages/batch",
-                    {"messages": [user_message, assistant_message]})
+        for message in (user_message, assistant_message):
+            message["origin"] = {"version": 1, "contributors": []}
+        try:
+            response = client.post(f"/api/v1/sessions/{self.sid}/messages/batch",
+                                   {"messages": [user_message, assistant_message]})
+            validate_readback([user_message, assistant_message], response)
+        except Exception as error:
+            raise OriginContractMismatch("Plain-message origin append is unconfirmed") from error
 
     def run(self) -> Optional[_VikingClient]:
         try:
             client = self.client
             self.post(client)
             return client
+        except OriginContractMismatch as error:
+            logger.warning("OpenViking origin readback failed; keeping capture progress: %s", error)
+            return None
         except Exception as e:
             logger.debug("OpenViking sync_turn failed, retrying: %s", e)
         retry_client = None
@@ -1336,6 +1458,9 @@ class _TurnUpload:
             retry_client = self.client
             self.post(retry_client)
             return retry_client
+        except OriginContractMismatch as error:
+            logger.warning("OpenViking origin readback failed; keeping capture progress: %s", error)
+            return None
         except Exception as retry_error:
             if retry_client is None or self.next_index >= len(self.batch_messages):
                 logger.warning("OpenViking sync_turn failed: %s", retry_error)
@@ -1346,7 +1471,8 @@ class _TurnUpload:
             path = f"/api/v1/sessions/{self.sid}/messages"
             for payload in self.batch_messages[self.next_index:]:
                 self._trace("POST %s message_index=%d payload=%s", path, self.next_index, json.dumps(payload, ensure_ascii=False))
-                retry_client.post(path, payload)
+                response = retry_client.post(path, payload)
+                validate_readback([payload], response)
                 self.next_index += 1
             return retry_client
         except Exception as fallback_error:
@@ -1404,6 +1530,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # snapshot+reset of the turn counter and the session-id rotation must be atomic against a concurrent
         # increment. See hermes-agent#28296 review.
         self._inflight_writers: Dict[str, Set[threading.Thread]] = {}
+        self._upload_tails: Dict[str, threading.Event] = {}  # guarded by _inflight_lock
         self._deferred_commit_threads: Set[threading.Thread] = set()
         self._commit_scope: Optional[_CommitScope] = None
         self._profile_prefetched_sessions: Set[str] = set()
@@ -1659,8 +1786,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """
         if not self._env_refresh_enabled:
             return self._client  # no baseline yet: keep whatever the caller wired up
-        with self._client_refresh_lock:
+        budget = _current_recall_budget()
+        acquired = self._client_refresh_lock.acquire(timeout=budget.remaining()) if budget else self._client_refresh_lock.acquire()
+        if not acquired:
+            raise TimeoutError("OpenViking client refresh budget exhausted")
+        try:
             return self._ensure_client_locked()
+        finally:
+            self._client_refresh_lock.release()
 
     def _profile_config_and_env(self) -> tuple[dict, Optional[dict]]:
         home = self._hermes_home if self._hermes_home_bound else None
@@ -1701,15 +1834,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if self._in_cooldown(settings_key):
                 return None
 
+        self._client = None
         self._endpoint, self._api_key, self._account, self._user, self._agent = settings_key
         try:
             client = self._build_client()
         except ImportError:
             logger.warning(_HTTPX_MISSING)
-            self._client = None
             return None
 
-        health_state, health_message = _classify_runtime_openviking_health(client, settings_key[0])
+        try:
+            health_state, health_message = _classify_runtime_openviking_health(client, settings_key[0])
+        except BaseException:
+            self._failed_refresh = (settings_key, time.monotonic())
+            raise
         if health_state == "healthy":
             self._publish_client(client, settings_key[0])
             return self._client
@@ -1783,13 +1920,24 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Session-start memory block (once per session) + query recall."""
+        started = time.monotonic()
+        cfg = self._recall_config()
+        budget = _RecallBudget(started + cfg["timeout_seconds"], cfg["request_timeout_seconds"])
+        token = _recall_budget.set(budget)
+        parts = []
         query_text = _derive_openviking_user_text(query).strip()
-        if not self._ensure_client():
-            return ""
-        effective_session_id = str(session_id or self._session_id or "").strip()
-        parts = [self._session_start_memory_context(effective_session_id)]
-        if len(query_text) >= _RECALL_QUERY_MIN_CHARS:
-            parts.append(self._search_prefetch_context(query_text, session_id=effective_session_id))
+        try:
+            if not self._ensure_client():
+                return ""
+            effective_session_id = str(session_id or self._session_id or "").strip()
+            if len(query_text) >= _RECALL_QUERY_MIN_CHARS:
+                parts.append(self._search_prefetch_context(query_text, session_id=effective_session_id))
+            parts.insert(0, self._session_start_memory_context(effective_session_id))
+        except TimeoutError:
+            logger.warning("OpenViking prefetch budget exhausted; retaining completed context")
+        finally:
+            _recall_budget.reset(token)
+            budget.close()
         parts = [p for p in parts if p]
         return "## OpenViking Context\n" + "\n\n".join(parts) if parts else ""
 
@@ -1799,6 +1947,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _remaining_recall_timeout(deadline: float, per_request_timeout: float) -> float:
+        budget = _current_recall_budget()
+        if budget is not None:
+            deadline = min(deadline, budget.deadline)
         remaining = deadline - time.monotonic()
         if remaining <= _RECALL_MIN_TIMEOUT_SECONDS:
             raise TimeoutError("OpenViking recall budget exhausted")
@@ -1816,9 +1967,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
             try:
                 return client.post("/api/v1/search/search", {**base_payload, "session_id": session_id},
                                    timeout=cls._remaining_recall_timeout(deadline, request_timeout))
-            except TimeoutError:
-                raise
             except Exception as e:
+                if _is_timeout_error(e):
+                    raise
                 logger.debug("OpenViking session-aware prefetch failed, falling back to search/find: %s", e)
         return client.post("/api/v1/search/find", base_payload, timeout=cls._remaining_recall_timeout(deadline, request_timeout))
 
@@ -1868,7 +2019,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         target_uri.append(f"{user_root}/peers/{sender_peer}/resources")
             # Without an actor, context-mode resource defaults include peers.
             # Use scoped list recall for that case, even with compression on.
-            if cfg["compress"] in ("server", "auto") and (scope != "peer" or sender_peer):
+            if (cfg["mode"] == "context" or (cfg["mode"] == "auto" and cfg["compress"] in ("server", "auto"))) and (scope != "peer" or sender_peer):
                 payload = {
                     "query": query_text,
                     "mode": "context",
@@ -1880,6 +2031,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 }
                 if session_id:
                     payload["session_id"] = session_id
+                if cfg["mode"] == "context":
+                    payload.update(query_expansion="off", rewrite=False)
                 if scope in ("shared", "peer"):
                     payload["peer_scope"] = "actor" if scope == "peer" else "all"
                 try:
@@ -1904,9 +2057,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         return str(
                             assembled.get("digest") or assembled.get("rendered") or ""
                         ).strip()
-                except TimeoutError:
-                    raise
                 except Exception as e:
+                    if _is_timeout_error(e):
+                        raise
                     logger.debug(
                         "OpenViking context rewrite unavailable, falling back to search: %s", e
                     )
@@ -1914,7 +2067,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 self._post_prefetch_search(
                     client,
                     query_text,
-                    session_id,
+                    session_id if cfg["mode"] == "auto" else "",
                     limit=max(cfg["limit"] * 4, 20),
                     context_type=["memory", "resource"] if cfg["resources"] else "memory",
                     deadline=deadline,
@@ -2000,7 +2153,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         resolved = {
             key.removeprefix("recall_"): self._setting(key, cfg, env=env) for key in _RECALL_SETTING_KEYS
         }
-        if resolved["compress"] in ("server", "auto"):
+        if resolved["mode"] == "auto" and resolved["compress"] in ("server", "auto"):
             # Retrieval plus server rewrite has a longer fuse. Keep explicit
             # user deadlines authoritative and the default off path unchanged.
             for key in ("recall_timeout_seconds", "recall_request_timeout_seconds"):
@@ -2326,17 +2479,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
         tool_calls_by_id, completed_tool_ids, skipped_tool_ids = _index_tool_calls(dict_messages)
         payload_messages: List[Dict[str, Any]] = []
         pending_tool_parts: List[Dict[str, Any]] = []
+        pending_tool_sources: List[Dict[str, Any]] = []
+        tool_sources_by_id: Dict[str, Dict[str, Any]] = {}
 
-        def emit(role: str, parts: List[Dict[str, Any]]) -> None:
+        def emit(role: str, parts: List[Dict[str, Any]], sources: List[Dict[str, Any]]) -> None:
             peer_id = assistant_peer_id if role == "assistant" else user_peer_id if role == "user" else ""
             peer = {"peer_id": peer_id} if peer_id else {}
-            payload_messages.append({"role": role, "parts": parts, **peer})
+            payload_messages.append({"role": role, "parts": parts, **peer, **_source_message_metadata(sources)})
 
         def flush_tool_parts() -> None:
-            nonlocal pending_tool_parts
+            nonlocal pending_tool_parts, pending_tool_sources
             if pending_tool_parts:
-                emit("assistant", pending_tool_parts)
+                emit("assistant", pending_tool_parts, pending_tool_sources)
                 pending_tool_parts = []
+                pending_tool_sources = []
 
         for message in dict_messages:
             role = str(message.get("role") or "")
@@ -2347,6 +2503,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if tool_id not in skipped_tool_ids and not _is_openviking_recall_tool_name(tool_name):
                     pending_tool_parts.append(_tool_part(tool_id, tool_name, prior_call.get("tool_input", {}), _tool_result_status(message),
                                                          tool_output=_message_text(message.get("content"))))
+                    if tool_id in tool_sources_by_id:
+                        pending_tool_sources.append(tool_sources_by_id[tool_id])
+                    pending_tool_sources.append(message)
                 continue
             if role not in {"user", "assistant"}:
                 continue
@@ -2358,13 +2517,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     if not isinstance(tool_call, dict):
                         continue
                     tool_id, tool_name = _tool_call_id(tool_call), _tool_call_name(tool_call)
+                    if tool_id:
+                        tool_sources_by_id[tool_id] = message
                     if tool_id in skipped_tool_ids or tool_id in completed_tool_ids or _is_openviking_recall_tool_name(tool_name):
                         continue
                     # Pre-scan caches non-empty ids; parse again for the uncached empty-id case.
                     tool_input = tool_calls_by_id[tool_id]["tool_input"] if tool_id in tool_calls_by_id else _tool_call_input(tool_call)
                     parts.append(_tool_part(tool_id, tool_name, tool_input, "pending"))
+            else:
+                tool_sources_by_id.clear()
             if parts:
-                emit(role, parts)
+                emit(role, parts, [message])
 
         flush_tool_parts()
         return payload_messages
@@ -2392,9 +2555,27 @@ class OpenVikingMemoryProvider(MemoryProvider):
             user_peer_id = self._sender_peer(turn_author.get("id")) if isinstance(turn_author, dict) else self._current_sender_peer()
 
         turn_messages = [dict(m) for m in (self._extract_current_turn_messages(messages, user_content, assistant_content) if messages is not None else [])]
+        plain_message_fallback = not turn_messages
+        if plain_message_fallback:
+            turn_messages = [
+                {"role": "user", "content": user_content[:4000]},
+                {"role": "assistant", "content": _message_text(assistant_content)[:4000]},
+            ]
         for message in turn_messages:
             if message.get("role") == "user":
-                message["content"] = user_content  # first user message carries the skill-stripped text
+                if isinstance(turn_author, dict) and isinstance(turn_author.get("id"), str) and turn_author["id"]:
+                    origin = _source_message_metadata([message])["origin"]
+                    origin["contributors"].append({
+                        "locator": {"provider": "hermes", "session_id": session_id or None},
+                        "refs": [{"kind": "host_row", "value": message["message_uid"]}] if message.get("message_uid") else [],
+                        "transport_sender": {
+                            "actor": {"identifier": turn_author["id"], "scope": self._gateway_platform or None},
+                            "basis": {"producer": "hermes", "field": "memory.sync_turn.turn_author.id"},
+                        },
+                        "content_class": "unknown",
+                    })
+                    message["origin_statements"] = _origin_statements(origin)
+                message["content"] = user_content[:4000] if plain_message_fallback else user_content
                 break
         batch_messages = self._messages_to_openviking_batch(turn_messages, assistant_peer_id=assistant_peer_id, user_peer_id=user_peer_id)
         if env_var_enabled(_SYNC_TRACE_ENV):
@@ -2407,26 +2588,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 _preview(user_content), _preview(assistant_content),
             )
 
-        def drop_empty() -> None:
-            if not self._inflight_writers.get(sid):
-                self._inflight_writers.pop(sid, None)
-
         cfg, env = self._profile_config_and_env()
         threshold = self._setting("commit_token_threshold", cfg, env=env)
 
-        def upload_and_check() -> None:
+        def upload_and_check(upload_finished: threading.Event) -> None:
             # Serialize writes with commits on the workers, so a slow commit never
             # blocks sync_turn. A write after a commit re-arms its recovery marker.
-            with self._writer_commit_lock:
-                with self._session_state_lock:
-                    if self._session_id == sid and self._commit_scope is scope and self._client is scope.client:
-                        self._turn_count += 1
-                        turn_count = self._turn_count
-                    else:
-                        turn_count = 1
-                self._mark_session_committed(sid, committed=False, scope=scope)
-                self._mark_session_pending(sid, scope=scope)
-                client = upload.run()
+            try:
+                with self._writer_commit_lock:
+                    with self._session_state_lock:
+                        if self._session_id == sid and self._commit_scope is scope and self._client is scope.client:
+                            self._turn_count += 1
+                            turn_count = self._turn_count
+                        else:
+                            turn_count = 1
+                    self._mark_session_committed(sid, committed=False, scope=scope)
+                    self._mark_session_pending(sid, scope=scope)
+                    client = upload.run()
+            finally:
+                # The next turn need not wait for this turn's metadata request.
+                upload_finished.set()
             if client is not None:
                 self._maybe_commit_live_session(sid, turn_count, threshold, client, scope)
 
@@ -2435,10 +2616,48 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not sid:
             return
         upload = _TurnUpload(client, sid, batch_messages, user_content, assistant_content, assistant_peer_id, user_peer_id)
-        self._spawn_tracked("openviking-sync", upload_and_check, self._inflight_lock, lambda: self._inflight_writers.setdefault(sid, set()),
-                            after_discard=drop_empty)
+        self._spawn_upload(sid, upload_and_check)
 
     # -- tracked worker threads ---------------------------------------------
+
+    def _spawn_upload(self, sid: str, body: Callable[[threading.Event], None]) -> None:
+        """Order each session's uploads before taking the shared write/commit lock.
+
+        Keep metadata checks concurrent and retain every worker for commit drains.
+        Publish a successor only after its thread starts, so a failed start cannot
+        strand later turns or let them bypass an earlier upload.
+        """
+        finished = threading.Event()
+
+        def _run() -> None:
+            try:
+                if previous is not None:
+                    previous.wait()
+                body(finished)
+            finally:
+                finished.set()
+                with self._inflight_lock:
+                    writers.discard(thread)
+                    if not writers:
+                        self._inflight_writers.pop(sid, None)
+                    if self._upload_tails.get(sid) is finished:
+                        self._upload_tails.pop(sid, None)
+
+        thread = spawn_context_thread(_run, name="openviking-sync")
+        with self._inflight_lock:
+            previous = self._upload_tails.get(sid)
+            writers = self._inflight_writers.setdefault(sid, set())
+            writers.add(thread)
+            try:
+                thread.start()
+            except Exception as exc:
+                writers.discard(thread)
+                if not writers:
+                    self._inflight_writers.pop(sid, None)
+                logger.warning("OpenViking upload worker failed to start: %s", exc)
+            else:
+                self._upload_tails[sid] = finished
+
 
     def _spawn_tracked(self, name: str, body: Callable[[], None], lock: threading.Lock, workers: Callable[[], Set[threading.Thread]],
                        *, after_discard: Callable[[], None] = None, skip_if: Callable[[], bool] = None) -> None:
@@ -2538,13 +2757,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _flock_close(lock_file, path: Optional[Path], label: str) -> None:
+        """Release the handle, keeping its inode stable for contenders and backup readers."""
         steps = []
         if lock_file is not None:
             if fcntl is not None:
                 steps.append(("unlock", lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)))
             steps.append(("close", lock_file.close))
-        if path is not None:
-            steps.append(("remove", lambda: path.unlink(missing_ok=True)))
         for verb, step in steps:
             try:
                 step()
@@ -2562,8 +2780,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._run_lock_file = self._flock_open(path)
             self._run_lock_path = path
         except Exception as e:
-            with suppress(Exception):
-                path.unlink(missing_ok=True)
             logger.debug("Could not acquire OpenViking run lock %s: %s", path, e)
 
     def _release_run_lock(self) -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Mapping, Optional, TypedDict, Union
 
+from .origin import OriginStatements
+
 ExtraFields = Mapping[str, Any]
 TargetURI = Union[str, List[str]]
 Level = Union[int, str, List[int]]
@@ -155,6 +157,7 @@ class Message(_RequiredMessage, total=False):
     turn_id: str
     message_kind: Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
     source_message_ids: List[str]
+    origin: OriginStatements
     telemetry: Any
 
 
@@ -164,6 +167,7 @@ class AddMessageOptions(_ExtraOptions, total=False):
     turn_id: str
     message_kind: Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
     source_message_ids: List[str]
+    origin: OriginStatements
     telemetry: Any
 
 

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from openviking.message import Message, TextPart
+from openviking.message import ImagePart, Message, TextPart
 from openviking.server.identity import RequestContext, Role, ToolContext
 from openviking.session.memory.dataclass import (
     MemoryField,
@@ -37,11 +37,17 @@ from openviking.session.memory.streaming_memory_updater import (
 )
 from openviking.session.memory.tools import MemoryReadTool
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+from openviking.session.memory.utils.source_metadata import (
+    memory_origin_view,
+    operation_source_metadata,
+)
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.agfs_config import AGFSConfig
+from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+from tests.unit.test_message_origin import recorded_origin
 
 URI = "viking://user/default/memories/notes/topic.md"
 RENAMED = "viking://user/default/memories/notes/renamed.md"
@@ -63,6 +69,175 @@ B = {
 }
 
 
+def origin_message(message_id="msg-A", text="原文"):
+    return Message.from_dict(
+        {
+            "id": message_id,
+            "role": "user",
+            "parts": [{"type": "text", "text": text}],
+            "created_at": "2026-10-17T09:10:11.123456+07:00",
+            "origin": recorded_origin(),
+        }
+    )
+
+
+def test_origin_chunk_selection_uses_parent_and_actual_view():
+    context = ExtractContext(
+        [origin_message(text="A" * 110 + ". " + "B" * 110 + ". " + "C" * 110 + ".")]
+    )
+    selection = context.select_message_origins("1")
+    assert selection.mode == "selected_ranges"
+    assert selection.view_ranges == ((1, 1),)
+    assert len(selection.messages) == 1
+    selected = selection.messages[0]
+    assert selected.facts.message_id == "msg-A"
+    assert [(chunk.index, chunk.count) for chunk in selected.chunks] == [(1, 3)]
+    assert (
+        selected.facts.origin_statements.contributors[0].times[0].literal
+        == "2026-10-17T09:10:11.123456+07:00"
+    )
+    assert context.messages[1].origin == context.messages[0].origin
+
+
+async def test_image_projection_keeps_origin_without_a_model_call():
+    from openviking.session.memory.vision_message_normalizer import (
+        replace_image_parts_with_descriptions,
+    )
+
+    message = origin_message()
+    message.parts.append(ImagePart(url="https://synthetic.invalid/image"))
+    message.turn_id = "native-turn"
+    projected = await replace_image_parts_with_descriptions([message], get_vlm=lambda: None)
+    assert projected[0].origin == message.origin
+    assert projected[0].created_at == message.created_at
+    assert projected[0].turn_id == "native-turn"
+    assert projected[0].parts == [TextPart("原文")]
+    assert isinstance(message.parts[-1], ImagePart)
+
+
+def test_origin_lawful_selections_share_run_without_false_conflict():
+    context = ExtractContext([origin_message("first"), origin_message("second")])
+    sources = [
+        MemoryOperationSource(**A, message_origins=context.select_message_origins(str(i)))
+        for i in (0, 1)
+    ]
+    op = operation()
+    op.sources = sources
+    fields = operation_source_metadata(op)
+    assert len(fields["source_extractions"]) == 2
+    assert "source_metadata_conflicts" not in fields
+    assert "source_provenance_ambiguous" not in fields
+    assert operation_source_metadata(op, old_fields=fields) == fields
+    selected_ids = {
+        source["message_origins"]["messages"][0]["facts"]["message_id"]
+        for source in fields["source_extractions"]
+    }
+    assert selected_ids == {"first", "second"}
+
+
+def test_origin_conflicting_known_literals_keep_variants_and_missing_witness():
+    first = origin_message()
+    altered = first.to_dict()
+    altered["origin"]["contributors"][0]["times"][0]["literal"] = "2026-10-17T09:10:12.123456+07:00"
+    op = operation()
+    op.sources = [
+        MemoryOperationSource.model_validate(A),
+        MemoryOperationSource(
+            **A, message_origins=ExtractContext([first]).select_message_origins()
+        ),
+        MemoryOperationSource(
+            **A,
+            message_origins=ExtractContext([Message.from_dict(altered)]).select_message_origins(),
+        ),
+    ]
+    fields = operation_source_metadata(op)
+    assert len(fields["source_extractions"]) == 3
+    assert fields["source_metadata_conflicts"] == ["extract-a"]
+    view = memory_origin_view(
+        MemoryFile(uri=URI, memory_type="notes", content="derived", extra_fields=fields)
+    )
+    assert view.ambiguous is True
+    assert any(conflict.field.endswith(".literal") for conflict in view.conflicts)
+    assert any(not extraction.messages for extraction in view.extractions)
+    assert view.exact_clause_proof is False
+    assert view.semantic_withdrawal_established is False
+
+
+async def test_origin_native_memory_persistence_and_reader_need_no_archive(native_target):
+    fs, ctx, updater = native_target
+    selection = ExtractContext([origin_message()]).select_message_origins()
+    source = {**A, "message_origins": selection}
+    for _ in range(2):
+        result = await updater.apply_operations(
+            ResolvedOperations(
+                upsert_operations=[operation(source)], delete_file_contents=[], errors=[]
+            ),
+            ctx,
+        )
+        assert result.errors == []
+    raw = await fs.read_file(URI, ctx=ctx)
+    memory = MemoryFileUtils.read(raw, uri=URI)
+    view = memory_origin_view(memory)
+    assert len(view.extractions) == 1
+    assert view.extractions[0].messages[0].facts.message_id == "msg-A"
+    contributor = view.extractions[0].messages[0].facts.origin_statements.contributors[0]
+    assert contributor.primary_author is None
+    assert contributor.transport_sender is not None
+    assert contributor.transport_sender.actor.identifier == "sender-A"
+    assert contributor.times[0].literal == "2026-10-17T09:10:11.123456+07:00"
+    assert "原文" not in raw
+    source_selection = view.extractions[0].source.message_origins
+    assert source_selection is not None
+    assert source_selection.mode == "extraction_batch_candidates"
+
+
+async def test_native_session_readback_archive_and_memory_keep_literal(native_target):
+    from openviking.message.origin import _parse_origin_input
+    from openviking.session.session import Session
+
+    fs, ctx, updater = native_target
+    session = Session(viking_fs=fs, ctx=ctx, session_id="native-origin")
+    await session.ensure_exists()
+    message = await session.add_message_async(
+        "user",
+        [TextPart("A" * 110 + ". " + "B" * 110 + ". " + "C" * 110 + ".")],
+        created_at="2026-10-17T09:10:11.123456+07:00",
+        source_message_ids=["record-A"],
+        origin=_parse_origin_input(
+            {key: value for key, value in recorded_origin().items() if key != "receiver"}
+        ),
+    )
+    stored = json.loads(await fs.read_file(f"{session.uri}/messages.jsonl", ctx=ctx))
+    assert stored == message.to_dict()
+    archive_uri = f"{session.uri}/history/archive_literal"
+    await fs.mkdir(archive_uri, exist_ok=True, ctx=ctx)
+    await fs.write_file(f"{archive_uri}/messages.jsonl", message.to_jsonl() + "\n", ctx=ctx)
+    restored = await session._archives.read_messages(archive_uri)
+    selection = ExtractContext(restored).select_message_origins("1")
+    result = await updater.apply_operations(
+        ResolvedOperations(
+            upsert_operations=[
+                operation({**A, "archive_uri": archive_uri, "message_origins": selection})
+            ],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        ctx,
+    )
+    assert result.errors == []
+    view = memory_origin_view(MemoryFileUtils.read(await fs.read_file(URI, ctx=ctx), uri=URI))
+    selected = view.extractions[0].messages[0]
+    assert selected.facts.message_id == message.id
+    assert [(chunk.index, chunk.count) for chunk in selected.chunks] == [(1, 3)]
+    assert selected.facts.origin == message.origin
+    assert (
+        selected.facts.origin_statements.contributors[0].times[0].literal
+        == "2026-10-17T09:10:11.123456+07:00"
+    )
+    assert selected.facts.origin_statements.contributors[0].primary_author is None
+    assert view.exact_clause_proof is False
+
+
 @pytest.fixture
 def schema():
     return MemoryTypeSchema(
@@ -78,6 +253,17 @@ def schema():
 
 @pytest.fixture
 def native_target(tmp_path, schema):
+    OpenVikingConfigSingleton.reset_instance()
+    OpenVikingConfigSingleton.initialize(
+        config_dict={
+            "storage": {
+                "workspace": str(tmp_path),
+                "agfs": {"backend": "local"},
+                "vectordb": {"backend": "local"},
+            },
+            "output_language_override": "en",
+        }
+    )
     client = create_agfs_client(
         RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path / "storage"), backend="local"))
     )
@@ -91,6 +277,7 @@ def native_target(tmp_path, schema):
         yield fs, ctx, updater
     finally:
         client.close()
+        OpenVikingConfigSingleton.reset_instance()
 
 
 def operation(source=None, *, uri=URI, old=None, **fields):
@@ -367,8 +554,13 @@ async def test_model_cannot_supply_system_fields_even_when_schema_lists_them(
 ):
     fs, ctx, updater = native_target
     schema.fields.append(
-        MemoryField(
-            name="source_extraction_id", field_type=FieldType.STRING, merge_op=MergeOp.REPLACE
+        MemoryField.model_validate(
+            {"name": "source_extraction_id", "field_type": "string", "merge_op": "replace"}
+        )
+    )
+    schema.fields.append(
+        MemoryField.model_validate(
+            {"name": "source_extractions", "field_type": "string", "merge_op": "replace"}
         )
     )
     provider = PatchMergeContextProvider(
@@ -383,11 +575,33 @@ async def test_model_cannot_supply_system_fields_even_when_schema_lists_them(
         read_file_contents={},
         link_enabled=False,
     )
+    forged = json.dumps(
+        [
+            {
+                "extraction_id": "forged",
+                "message_origins": {
+                    "mode": "extraction_batch_candidates",
+                    "messages": [{"facts": {"message_id": "forged-author"}}],
+                },
+            }
+        ]
+    )
     program = (
-        'sdk.create_notes(name="topic", content="Safe text.", source_extraction_id="forged")'
+        f'sdk.create_notes(name="topic", content="Safe text.", source_extraction_id="forged", source_extractions={forged!r})'
         if protocol_name == "python"
-        else '{"notes": [{"page_id": 100, "name": "topic", "content": "Safe text.", '
-        '"source_extraction_id": "forged"}]}'
+        else json.dumps(
+            {
+                "notes": [
+                    {
+                        "page_id": 100,
+                        "name": "topic",
+                        "content": "Safe text.",
+                        "source_extraction_id": "forged",
+                        "source_extractions": forged,
+                    }
+                ]
+            }
+        )
     )
     parsed, error = protocol.parse(program, context)
     assert error is None
@@ -408,8 +622,17 @@ async def test_model_cannot_supply_system_fields_even_when_schema_lists_them(
         "memory_type": "notes",
         "user_id": "default",
     }
-    _inherit_source_metadata_to_merged_operations([operation(B)], resolved.upsert_operations)
+    trusted = {**B, "message_origins": ExtractContext([origin_message()]).select_message_origins()}
+    _inherit_source_metadata_to_merged_operations([operation(trusted)], resolved.upsert_operations)
     await updater._apply_upsert(resolved.upsert_operations[0], ctx)
     stored = MemoryFileUtils.read(await fs.read_file(URI, ctx=ctx))
     assert stored.extra_fields["source_extraction_id"] == "extract-b"
-    assert stored.extra_fields["source_extractions"] == [B]
+    view = memory_origin_view(stored)
+    assert len(view.extractions) == 1
+    assert view.extractions[0].source.extraction_id == "extract-b"
+    assert view.extractions[0].messages[0].facts.message_id == "msg-A"
+    assert (
+        view.extractions[0].messages[0].facts.origin_statements.contributors[0].primary_author
+        is None
+    )
+    assert "forged-author" not in json.dumps(stored.extra_fields)

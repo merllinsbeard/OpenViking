@@ -117,7 +117,8 @@ export async function catchUpTurns({
 
   if (ok && state.captureFormatVersion !== CAPTURE_FORMAT_VERSION) {
     const oldCursor = Math.max(0, Number(state.capturedTurnCount) || 0);
-    state.capturedTurnCount = oldCursor - excludedLegacyTurnIndices.filter((index) => index < oldCursor).length;
+    state.capturedTurnCount = state.captureFormatVersion < 2 || state.captureFormatVersion == null
+      ? oldCursor - excludedLegacyTurnIndices.filter((index) => index < oldCursor).length : oldCursor;
     state.captureFormatVersion = CAPTURE_FORMAT_VERSION;
     // The caller holds the session lock. Persist the corrected cursor before
     // any append; a failed send must retry from this new coordinate system.
@@ -177,6 +178,16 @@ export async function catchUpTurns({
       ? { role: turn.role, parts: turn.parts }
       : { role: turn.role, content: turn.text };
     if (activePeerId) body.peer_id = activePeerId;
+    for (const field of ["created_at", "turn_id", "message_kind", "source_message_ids"]) {
+      if (turn[field] != null) body[field] = turn[field];
+    }
+    body.origin = {
+      ...turn.origin,
+      contributors: turn.origin.contributors.map((contributor) => ({
+        ...contributor,
+        locator: { ...contributor.locator, session_id: state.codexSessionId ?? null },
+      })),
+    };
     return body;
   });
 

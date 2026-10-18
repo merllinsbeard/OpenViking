@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { mockOriginReadback } from "../../memory-plugin-shared/testing/support.mjs";
 
 const stateDir = await mkdtemp(join(tmpdir(), "ov-codex-startup-"));
 process.env.OPENVIKING_CODEX_STATE_DIR = stateDir;
@@ -56,8 +57,9 @@ async function catchUp(id, transcriptPath, sent, { oldCursor, fail = false } = {
             "migration must be durable before the first send");
         }
         if (fail) return { ok: false, status: 500 };
-        sent.push(...JSON.parse(init.body).messages);
-        return { ok: true, result: {} };
+        const messages = JSON.parse(init.body).messages;
+        sent.push(...messages);
+        return { ok: true, result: mockOriginReadback(messages) };
       },
     });
     return { result, state };

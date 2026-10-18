@@ -1032,8 +1032,7 @@ async def merge_one_memory_type_operations(
     )
     if vlm_resolver is None:
         raise RuntimeError(
-            "merge_one_memory_type_operations requires a VLM resolver "
-            "for account-owned work"
+            "merge_one_memory_type_operations requires a VLM resolver for account-owned work"
         )
     vlm_config = await vlm_resolver.get_vlm(ctx.account_id)
     provider = PatchMergeContextProvider(
@@ -1328,6 +1327,7 @@ def _inherit_source_metadata_to_merged_operations(
         for key in SYSTEM_SOURCE_FIELDS:
             merged_op.memory_fields.pop(key, None)
         merged_op.source = None
+        merged_op.source_selection = None
         merged_op.sources = [
             MemoryOperationSource.model_validate(source)
             for metadata in candidate_metadata
@@ -1475,7 +1475,12 @@ def attach_source_to_request_operations(request: MemoryUpdateRequest) -> None:
         return
     for op in list(getattr(request.operations, "upsert_operations", []) or []):
         if getattr(op, "source", None) is None:
-            op.source = source
+            if op.source_selection is None:
+                op.source_ambiguous = True
+                selection = source.message_origins
+            else:
+                selection = op.source_selection
+            op.source = source.model_copy(update={"message_origins": selection})
         source_extraction_id = getattr(op.source, "extraction_id", None)
         if source_extraction_id:
             op.memory_fields.setdefault("source_extraction_id", source_extraction_id)
@@ -1498,6 +1503,9 @@ def memory_operation_source_from_request(
         task_id=_optional_str(metadata.get("task_id")),
         trace_id=_optional_str(metadata.get("trace_id")),
         extracted_at=_optional_str(metadata.get("extracted_at")),
+        message_origins=ExtractContext(
+            list(request.messages or []), split_long_text_messages=False
+        ).select_message_origins(),
     )
 
 

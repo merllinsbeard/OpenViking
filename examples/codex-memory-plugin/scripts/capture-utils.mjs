@@ -1,6 +1,7 @@
 import {
   extractCaptureTurns as extractSharedCaptureTurns,
 } from "./shared/capture-utils.mjs";
+import { observedTime, originStatements } from "./shared/message-origin.mjs";
 
 // Named one by one rather than re-exported wholesale: this module has an
 // `extractCaptureTurns` of its own, and `export *` would let the shared one
@@ -37,15 +38,82 @@ const COMPLETED_TURN_TOOL_TYPES = new Set([
 
 const FAILED_TOOL_STATUSES = new Set(["failed", "error", "declined"]);
 const TERMINAL_TOOL_STATUSES = new Set(["completed", ...FAILED_TOOL_STATUSES]);
+const MESSAGE_KINDS = new Set(["user_query", "assistant_step", "tool_transport", "checkpoint"]);
+
+function captureSourceFields(entry) {
+  const payload = entry?.payload && typeof entry.payload === "object" ? entry.payload : entry;
+  const records = [payload?.message, payload, entry].filter(Boolean);
+  const suppliedString = (field) => records.map((record) => record[field])
+    .find((value) => typeof value === "string" && value.length > 0);
+  const ids = records.flatMap((record) => Array.isArray(record.source_message_ids)
+    ? record.source_message_ids.filter((id) => typeof id === "string" && id.length > 0)
+    : []);
+  const nativeId = payload?.message?.id ?? payload?.id;
+  if (typeof nativeId === "string" && nativeId.length > 0) ids.push(nativeId);
+  const kind = suppliedString("message_kind");
+  const times = [];
+  const time = (literal, meaning, field) => {
+    if (typeof literal !== "string" && (typeof literal !== "number" || !Number.isFinite(literal))) return;
+    times.push(observedTime(literal, meaning, { producer: "codex", field }));
+  };
+  time(entry?.timestamp, "provider_record", "entry.timestamp");
+  const timeFields = entry?.payload && typeof entry.payload === "object"
+    ? [[payload?.message, "payload.message.created_at"], [payload, "payload.created_at"], [entry, "entry.created_at"]]
+    : [[entry?.message, "message.created_at"], [entry, "created_at"]];
+  for (const [record, field] of timeFields) {
+    if (record?.created_at != null) time(record.created_at, "unknown", field);
+  }
+  const contributor = {
+    locator: { provider: "codex" },
+    refs: [
+      ...(typeof nativeId === "string" && nativeId ? [{ kind: "provider_record", value: nativeId }] : []),
+      ...ids.filter((id) => id !== nativeId).map((value) => ({ kind: "supplied_ref", value })),
+    ],
+    times, content_class: "unknown",
+  };
+  return {
+    created_at: suppliedString("created_at")
+      ?? (typeof entry?.timestamp === "string" && entry.timestamp.length > 0 ? entry.timestamp : undefined),
+    turn_id: suppliedString("turn_id"),
+    message_kind: MESSAGE_KINDS.has(kind) ? kind : undefined,
+    source_message_ids: ids.length || records.some((record) => Array.isArray(record.source_message_ids))
+      ? [...new Set(ids)] : undefined,
+    origin: originStatements({ version: 1, contributors: [contributor] }),
+  };
+}
+
+function mergeSourceFields(entries) {
+  const fields = {};
+  for (const field of ["created_at", "turn_id", "message_kind"]) {
+    const values = new Set(entries.map((entry) => entry[field]).filter((value) => value != null));
+    fields[field] = entries.some((entry) => entry[field] === null) || values.size > 1
+      ? null : [...values][0];
+  }
+  fields.source_message_ids = entries.some((entry) => entry.source_message_ids !== undefined)
+    ? [...new Set(entries.flatMap((entry) => entry.source_message_ids ?? []))] : undefined;
+  fields.origin = {
+    version: 1,
+    contributors: [...new Map(entries.flatMap((entry) => entry.origin?.contributors ?? [])
+      .map((contributor) => [JSON.stringify(contributor), contributor])).values()],
+  };
+  return fields;
+}
 
 function inheritedEntry(entry, type, payload) {
-  const turnId = entry?.payload?.turn_id;
+  const inherited = { ...payload };
+  for (const field of ["created_at", "turn_id", "message_kind", "source_message_ids"]) {
+    if (inherited[field] == null && entry?.payload?.[field] != null) {
+      inherited[field] = entry.payload[field];
+    }
+  }
+  if (Array.isArray(entry?.payload?.source_message_ids) && Array.isArray(payload?.source_message_ids)) {
+    inherited.source_message_ids = [...entry.payload.source_message_ids, ...payload.source_message_ids];
+  }
   return {
     ...entry,
     type,
-    payload: turnId != null && payload?.turn_id == null
-      ? { ...payload, turn_id: turnId }
-      : payload,
+    payload: inherited,
+    origin: mergeSourceFields([entry, captureSourceFields({ type, payload })]).origin,
   };
 }
 
@@ -175,21 +243,31 @@ function responseItemKey(entry) {
 
 function deduplicateCodexToolEvents(rolloutEntries) {
   const entries = [];
-  const responseItems = new Set();
+  const responseItems = new Map();
   for (const entry of rolloutEntries || []) {
     const key = responseItemKey(entry);
-    if (key && responseItems.has(key)) continue;
-    if (key) responseItems.add(key);
+    if (key && responseItems.has(key)) {
+      responseItems.get(key).push(entry);
+      continue;
+    }
+    if (key) responseItems.set(key, [entry]);
     entries.push(entry);
+  }
+  for (const group of responseItems.values()) {
+    Object.assign(group[0], mergeSourceFields(group));
   }
 
   const completedTools = new Map();
   const preferredCompleted = new Map();
+  const completedSources = new Map();
   for (const entry of entries) {
     const tool = completedToolEvent(entry);
     if (!tool?.id || !tool.name) continue;
     completedTools.set(entry, tool);
     const key = completedToolKey(tool);
+    const sources = completedSources.get(key) ?? [];
+    sources.push(entry);
+    completedSources.set(key, sources);
     const previous = preferredCompleted.get(key);
     if (!previous || completedToolPriority(entry) >= completedToolPriority(previous)) {
       preferredCompleted.set(key, entry);
@@ -198,8 +276,10 @@ function deduplicateCodexToolEvents(rolloutEntries) {
   const completedNamesById = new Map();
   for (const entry of preferredCompleted.values()) {
     const tool = completedTools.get(entry);
-    const names = completedNamesById.get(tool.id) ?? new Set();
-    names.add(tool.name);
+    const names = completedNamesById.get(tool.id) ?? new Map();
+    const keys = names.get(tool.name) ?? new Set();
+    keys.add(completedToolKey(tool));
+    names.set(tool.name, keys);
     completedNamesById.set(tool.id, names);
   }
   const responseNamesById = new Map();
@@ -213,11 +293,23 @@ function deduplicateCodexToolEvents(rolloutEntries) {
       responseNamesById.set(payload.call_id || payload.id, payload.name);
     }
   }
+  for (const entry of entries) {
+    const payload = entry?.payload;
+    if (entry?.type !== "response_item" || !RESPONSE_TOOL_TYPES.has(payload?.type)) continue;
+    const id = payload.call_id || payload.id;
+    const names = completedNamesById.get(id);
+    const name = payload.name || responseNamesById.get(id)
+      || (names?.size === 1 ? [...names.keys()][0] : undefined);
+    const keys = names?.get(name);
+    if (keys?.size === 1) completedSources.get([...keys][0]).push(entry);
+  }
 
   return entries.flatMap((entry) => {
     const tool = completedTools.get(entry);
     if (tool?.id && tool.name) {
-      return preferredCompleted.get(completedToolKey(tool)) === entry ? [entry] : [];
+      return preferredCompleted.get(completedToolKey(tool)) === entry
+        ? [{ ...entry, ...mergeSourceFields(completedSources.get(completedToolKey(tool))) }]
+        : [];
     }
     const payload = entry?.payload;
     const id = payload?.call_id || payload?.id;
@@ -432,7 +524,9 @@ function withoutStartupContext(entries, cfg) {
 }
 
 export function extractCaptureTranscript(rolloutEntries, cfg = {}) {
-  const expanded = expandCodexRolloutEntries(rolloutEntries);
+  const sourced = (rolloutEntries || []).map((entry) => ({ ...entry, ...captureSourceFields(entry) }));
+  const expanded = expandCodexRolloutEntries(sourced)
+    .map((entry) => ({ ...entry, ...captureSourceFields(entry), origin: entry.origin }));
   const deduplicated = deduplicateCodexToolEvents(expanded);
   const normalized = normalizeCodexNativeToolEvents(deduplicated);
   const completed = normalizeCodexCompletedToolEvents(normalized);

@@ -19,6 +19,13 @@ This is the Codex counterpart to [`claude-code-memory-plugin`](../claude-code-me
 
 It also starts a local stdio MCP proxy that forwards to OpenViking's native `/mcp` endpoint with credentials resolved from env / `ovcli.conf`, so the model has direct access to the server's retrieval, memory, resource, skill (`add_skill`), watch, filesystem, and code-navigation tools.
 
+Capture requires a server with native origin v1 and JSONL readback support.
+It preserves provider-record time separately from explicitly supplied dates and
+keeps all tool contributors; roles do not identify the primary author. Missing,
+changed, or uncertain acknowledgements retain capture progress and do not enter
+the text or offline retry fallback. Format 3 applies to future captures and keeps
+the existing format-2 cursor; upgrading does not recapture historical turns.
+
 ## Quick Start
 
 There are two install paths. **Pick one — don't mix them** (both surface the same `openviking-memory` plugin; enabling it from both would run the hooks twice). The **one-line installer (A)** is the recommended path for most users; the marketplace install (B) is useful when you already manage `~/.openviking/ovcli.conf` yourself.

@@ -1,5 +1,6 @@
 import { enqueue } from "./pending-queue.mjs";
 import { isRetryableFailure } from "./retryable.mjs";
+import { OriginContractMismatch, originStatements, validateOriginReadback } from "./message-origin.mjs";
 
 export const BATCH_LIMIT = 100;
 
@@ -17,6 +18,14 @@ function makeResult() {
     usedBatch: true,
     lastError: null,
   };
+}
+
+function originFailure(result, remaining, error) {
+  result.failed += remaining;
+  result.retryable = false;
+  result.lastError = error instanceof OriginContractMismatch
+    ? error : new OriginContractMismatch("Origin append outcome is uncertain");
+  return result;
 }
 
 async function enqueueRemainder(sessionId, payloads, startIndex, result, retryable, lastError) {
@@ -49,16 +58,24 @@ async function sendSerial(fetchJSON, sessionId, payloads, startIndex, opts, resu
   result.usedBatch = false;
   const encodedSid = encodeURIComponent(sessionId);
   for (let i = startIndex; i < payloads.length; i++) {
-    const res = await fetchJSON(`/api/v1/sessions/${encodedSid}/messages`, {
-      method: "POST",
-      body: JSON.stringify(payloads[i]),
-    });
+    let res;
+    try {
+      res = await fetchJSON(`/api/v1/sessions/${encodedSid}/messages`, {
+        method: "POST",
+        body: JSON.stringify(payloads[i]),
+      });
+      if (res?.ok) validateOriginReadback([payloads[i]], res.result);
+    } catch (error) {
+      if (payloads[i].origin == null) throw error;
+      return originFailure(result, payloads.length - i, error);
+    }
     if (res?.ok) {
       result.sent++;
       await opts.onSent?.(1);
       continue;
     }
 
+    if (payloads[i].origin != null) return originFailure(result, payloads.length - i, res?.error);
     const retryable = isRetryableSendFailure(res);
     if (opts.enqueueOnRetryable) {
       return enqueueRemainder(sessionId, payloads, i, result, retryable, res?.error ?? res);
@@ -86,14 +103,29 @@ export async function sendSessionMessages(fetchJSON, sessionId, payloads, opts =
   const result = makeResult();
   const messages = Array.isArray(payloads) ? payloads : [];
   if (messages.length === 0) return result;
+  try {
+    for (const message of messages) {
+      if (message.origin != null) originStatements(message.origin);
+    }
+  } catch (error) {
+    return originFailure(result, messages.length, error);
+  }
 
   const encodedSid = encodeURIComponent(sessionId);
   for (let start = 0; start < messages.length; start += BATCH_LIMIT) {
     const chunk = messages.slice(start, start + BATCH_LIMIT);
-    const res = await fetchJSON(`/api/v1/sessions/${encodedSid}/messages/batch`, {
-      method: "POST",
-      body: JSON.stringify({ messages: chunk }),
-    });
+    let res;
+    const requiresOrigin = chunk.some((message) => message.origin != null);
+    try {
+      res = await fetchJSON(`/api/v1/sessions/${encodedSid}/messages/batch`, {
+        method: "POST",
+        body: JSON.stringify({ messages: chunk }),
+      });
+      if (res?.ok) validateOriginReadback(chunk, res.result);
+    } catch (error) {
+      if (!requiresOrigin) throw error;
+      return originFailure(result, messages.length - start, error);
+    }
 
     if (res?.ok) {
       result.sent += chunk.length;
@@ -106,6 +138,7 @@ export async function sendSessionMessages(fetchJSON, sessionId, payloads, opts =
       return sendSerial(fetchJSON, sessionId, messages, start, opts, result);
     }
 
+    if (requiresOrigin) return originFailure(result, messages.length - start, res?.error);
     const retryable = isRetryableSendFailure(res);
     if (opts.enqueueOnRetryable) {
       return enqueueRemainder(sessionId, messages, start, result, retryable, res?.error ?? res);

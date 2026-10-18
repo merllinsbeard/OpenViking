@@ -297,6 +297,39 @@ For structured messages, `parts` accepts either wire-format dictionaries or
 the SDK's `TextPart`, `ContextPart`, `ImagePart`, and `ToolPart` objects. The
 SDK serializes both forms to the same HTTP JSON payload.
 
+For source attribution, pass domain `OriginStatements` through `options["origin"]`
+or each batch message's `origin`. A contributor carries its own references,
+literal times, and optional sender/author claims; a message role does not establish
+authorship. For example, a Codex record time is a provider observation:
+
+```python
+from openviking_sdk import (
+    ContributorStatement, FieldBasis, OriginStatements, SourceLocator,
+    SourceRef, TimeStatement,
+)
+
+origin = OriginStatements(contributors=(ContributorStatement(
+    locator=SourceLocator("codex", session_id="native-session"),
+    refs=(SourceRef("provider_record", "item-A"),),
+    times=(TimeStatement(
+        "2026-10-17T09:10:11.123456+07:00", "rfc3339", "provider_record",
+        FieldBasis("codex", "entry.timestamp"),
+    ),),
+),))
+result = client.add_message("demo-session", "user", "Forwarded text",
+                            options={"origin": origin})
+accepted = result["accepted_origins"][0]  # AcceptedOrigin, after JSONL readback validation
+print(accepted.origin.receiver.session_ingest_started_at)
+```
+
+The receiver time marks processing after batch validation and before append;
+it is separate from source time. Claims remain caller supplied. Old stored
+omissions stay unknown. Explicit origin requires a compatible server: missing,
+partial, or changed readback raises `OriginContractMismatch` before success is
+returned. Keep capture progress unchanged; an uncertain append may already have
+landed, so automatic resubmission is not an exactly-once guarantee. Sync and
+async clients apply the same check, including every physical fan-out member.
+
 Use the method's typed `options` dictionary for advanced fields, such as
 `processing_mode`, retrieval filters, session extraction configuration, or
 `telemetry`.

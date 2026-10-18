@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
+import { mockOriginReadback, readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
 import { enqueue } from "./shared/pending-queue.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -530,7 +530,7 @@ function sweepHandler(requests, { onBatch, batchStatus = 200 } = {}) {
         res.end(JSON.stringify({ status: "error", error: { message: "batch failed" } }));
         return;
       }
-      writeJson(res, { status: "ok", result: { ok: true } });
+      writeJson(res, { status: "ok", result: mockOriginReadback(body.messages) });
       return;
     }
     return base(req, res);

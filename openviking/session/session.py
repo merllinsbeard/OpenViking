@@ -9,16 +9,29 @@ import asyncio
 import inspect
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 from uuid import uuid4
+
+from pydantic import TypeAdapter
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import canonical_session_uri
 from openviking.core.peer_id import normalize_peer_id, safe_peer_id
 from openviking.message import Message, Part
-from openviking.message.part import TextPart, ToolPart
+from openviking.message.origin import (
+    FanoutGroup,
+    IngestStamp,
+    OriginContractMismatch,
+    OriginStatements,
+    RecordedOrigin,
+    WholeInputMessage,
+    _message_facts,
+    _parse_origin_input,
+    _reject_receiver_facts,
+)
+from openviking.message.part import ContextPart, ImagePart, TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
 from openviking.session import working_memory as wm
@@ -93,6 +106,24 @@ _MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS = 1.0
 _MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS = 8.0
 _AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({"experiences"})
 _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class _ValidatedIngestSpec:
+    role: Literal["user", "assistant"]
+    parts: tuple[Part, ...]
+    peer_id: str | None
+    created_at: str | datetime | None
+    turn_id: str | None
+    message_kind: Literal["user_query", "assistant_step", "tool_transport", "checkpoint"] | None
+    source_message_ids: tuple[str, ...] | None
+    origin: OriginStatements | None
+
+
+@dataclass(frozen=True)
+class _PreparedAddition:
+    input_index: int
+    message: Message
 
 
 def _load_render_prompt() -> Callable[..., str]:
@@ -694,18 +725,24 @@ class Session:
             role == "user" and len(parts) > 1 and all(isinstance(part, ToolPart) for part in parts)
         )
 
-    async def _append_messages_authoritatively(self, messages: List[Message]) -> None:
+    async def _append_messages_authoritatively(
+        self,
+        additions: tuple[_PreparedAddition, ...],
+        *,
+        require_origin_readback: bool,
+    ) -> List[Message]:
         """Reload and append under the session path lock.
 
         Different workers can hold stale Session objects. Without sharing the
         commit lock, an append between commit's root read and root rewrite can
         be overwritten even though add_message already returned successfully.
         """
+        messages = [addition.message for addition in additions]
         if not messages:
-            return
+            return []
         if not self._viking_fs:
             await self._apply_appended_messages_to_state(messages)
-            return
+            return messages
 
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
         lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
@@ -746,7 +783,25 @@ class Session:
                     batch_content,
                     ctx=self.ctx,
                 )
+            if require_origin_readback:
+                stored = await self._read_live_messages_strict()
+                by_id: dict[str, list[Message]] = {}
+                for message in stored:
+                    by_id.setdefault(message.id, []).append(message)
+                readback = []
+                for expected in messages:
+                    matches = by_id.get(expected.id, [])
+                    if len(matches) != 1 or json.dumps(
+                        asdict(_message_facts(matches[0])), sort_keys=True
+                    ) != json.dumps(asdict(_message_facts(expected)), sort_keys=True):
+                        raise OriginContractMismatch(
+                            f"Origin readback mismatch for appended message {expected.id}"
+                        )
+                    readback.append(matches[0])
+                self._messages = stored
+                messages = readback
             await self._save_meta()
+            return messages
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
@@ -780,35 +835,80 @@ class Session:
             # path lock as the counters above.
             self._meta.last_message_at = get_current_timestamp()
 
-    def _build_message_groups(
-        self,
-        messages_spec: List[dict],
-    ) -> List[List[Message]]:
-        """Build messages grouped by input spec, preserving tool-output budgets.
-
-        Args:
-            messages_spec: List of dicts, each with keys:
-                role, parts, peer_id/created_at and optional semantic fields.
-        """
-        message_groups = []
-        for i, spec in enumerate(messages_spec):
-            if "role" not in spec:
-                raise ValueError(f"messages_spec[{i}]: missing required key 'role'")
-            if "parts" not in spec:
-                raise ValueError(f"messages_spec[{i}]: missing required key 'parts'")
-            role = spec["role"]
-            parts = spec["parts"]
-            created_at = spec.get("created_at") or datetime.now(timezone.utc).isoformat()
-            turn_id = spec.get("turn_id")
-            message_kind = spec.get("message_kind")
-            source_message_ids = spec.get("source_message_ids")
-
+    def _parse_ingest_specs(self, values: List[dict]) -> tuple[_ValidatedIngestSpec, ...]:
+        specs = []
+        for index, value in enumerate(values):
+            if not isinstance(value, dict) or "role" not in value or "parts" not in value:
+                raise ValueError(f"messages_spec[{index}]: role and parts are required")
+            _reject_receiver_facts(value)
+            if value["role"] not in ("user", "assistant"):
+                raise ValueError(f"messages_spec[{index}]: invalid interaction role")
+            parts = value["parts"]
+            if not isinstance(parts, (list, tuple)):
+                raise ValueError(f"messages_spec[{index}]: parts must be a sequence")
+            if any(
+                not isinstance(part, (TextPart, ContextPart, ImagePart, ToolPart)) for part in parts
+            ):
+                raise ValueError(f"messages_spec[{index}]: parts must contain native Parts")
+            for part in parts:
+                TypeAdapter(Part).validate_python(asdict(part))
             try:
-                peer_id = normalize_peer_id(spec.get("peer_id"))
+                peer_id = normalize_peer_id(value.get("peer_id"))
             except ValueError as exc:
                 from openviking_cli.exceptions import InvalidArgumentError
 
                 raise InvalidArgumentError(str(exc)) from exc
+            source_ids = value.get("source_message_ids")
+            if source_ids is not None and (
+                not isinstance(source_ids, (list, tuple))
+                or any(not isinstance(item, str) for item in source_ids)
+            ):
+                raise ValueError("source_message_ids must be a sequence of strings")
+            for name in ("turn_id", "message_kind"):
+                if value.get(name) is not None and not isinstance(value[name], str):
+                    raise ValueError(f"{name} must be a string")
+            if value.get("message_kind") not in (
+                None,
+                "user_query",
+                "assistant_step",
+                "tool_transport",
+                "checkpoint",
+            ):
+                raise ValueError("Unsupported message_kind")
+            created_at = value.get("created_at")
+            if created_at is not None and not isinstance(created_at, (str, datetime)):
+                raise ValueError("created_at must be a string or datetime")
+            origin = value.get("origin")
+            specs.append(
+                _ValidatedIngestSpec(
+                    role=value["role"],
+                    parts=tuple(parts),
+                    peer_id=peer_id,
+                    created_at=created_at,
+                    turn_id=value.get("turn_id"),
+                    message_kind=value.get("message_kind"),
+                    source_message_ids=tuple(source_ids) if source_ids is not None else None,
+                    origin=_parse_origin_input(origin) if origin is not None else None,
+                )
+            )
+        return tuple(specs)
+
+    def _build_message_groups(
+        self,
+        messages_spec: tuple[_ValidatedIngestSpec, ...],
+        *,
+        session_ingest_started_at: str,
+    ) -> tuple[_PreparedAddition, ...]:
+        """Assign receiver scope to validated inputs before externalization."""
+        additions = []
+        for i, spec in enumerate(messages_spec):
+            role = spec.role
+            parts = list(spec.parts)
+            created_at = spec.created_at or session_ingest_started_at
+            turn_id = spec.turn_id
+            message_kind = spec.message_kind
+            source_message_ids = spec.source_message_ids
+            peer_id = spec.peer_id
 
             if self._is_tool_result_aggregate(role, parts):
                 msgs = [
@@ -826,7 +926,6 @@ class Session:
                     )
                     for part in parts
                 ]
-                message_groups.append(msgs)
             else:
                 msg = Message(
                     id=f"msg_{uuid4().hex}",
@@ -840,9 +939,25 @@ class Session:
                         list(source_message_ids) if source_message_ids is not None else None
                     ),
                 )
-                message_groups.append([msg])
-
-        return message_groups
+                msgs = [msg]
+            group_id = f"ingest_{uuid4().hex}"
+            for member_index, message in enumerate(msgs):
+                applicability = (
+                    FanoutGroup(
+                        group_id=group_id, member_index=member_index, member_count=len(msgs)
+                    )
+                    if len(msgs) > 1
+                    else WholeInputMessage(group_id=group_id)
+                )
+                message.origin = RecordedOrigin(
+                    statements=spec.origin if spec.origin is not None else OriginStatements(),
+                    receiver=IngestStamp(
+                        session_ingest_started_at=session_ingest_started_at,
+                        applicability=applicability,
+                    ),
+                )
+                additions.append(_PreparedAddition(input_index=i, message=message))
+        return tuple(additions)
 
     def add_messages(
         self,
@@ -856,15 +971,22 @@ class Session:
         messages_spec: List[dict],
     ) -> List[Message]:
         """Asynchronously add multiple messages without blocking the caller loop."""
-        message_groups = self._build_message_groups(messages_spec)
-        messages = []
-        for group in message_groups:
+        specs = self._parse_ingest_specs(messages_spec)
+        require_readback = any(spec.origin is not None for spec in specs)
+        if require_readback and not self._viking_fs:
+            raise OriginContractMismatch("Persistent origin readback requires native storage")
+        ingest_started_at = datetime.now(timezone.utc).isoformat()
+        additions = self._build_message_groups(specs, session_ingest_started_at=ingest_started_at)
+        groups: dict[int, list[Message]] = {}
+        for addition in additions:
+            groups.setdefault(addition.input_index, []).append(addition.message)
+        for group in groups.values():
             await self._tool_outputs.externalize_group(
                 group, self._tool_output_externalization_config
             )
-            messages.extend(group)
-        await self._append_messages_authoritatively(messages)
-        return messages
+        return await self._append_messages_authoritatively(
+            additions, require_origin_readback=require_readback
+        )
 
     def add_message(
         self,
@@ -875,6 +997,8 @@ class Session:
         turn_id: Optional[str] = None,
         message_kind: Optional[str] = None,
         source_message_ids: Optional[List[str]] = None,
+        *,
+        origin: OriginStatements | None = None,
     ) -> Message:
         """Add a message.
 
@@ -891,6 +1015,7 @@ class Session:
                     "turn_id": turn_id,
                     "message_kind": message_kind,
                     "source_message_ids": source_message_ids,
+                    "origin": origin,
                 }
             ]
         )
@@ -905,6 +1030,8 @@ class Session:
         turn_id: Optional[str] = None,
         message_kind: Optional[str] = None,
         source_message_ids: Optional[List[str]] = None,
+        *,
+        origin: OriginStatements | None = None,
     ) -> Message:
         """Asynchronously add one message through the authoritative path lock."""
         msgs = await self.add_messages_async(
@@ -917,6 +1044,7 @@ class Session:
                     "turn_id": turn_id,
                     "message_kind": message_kind,
                     "source_message_ids": source_message_ids,
+                    "origin": origin,
                 }
             ]
         )
@@ -1649,7 +1777,10 @@ class Session:
         """
         # ponytail: reuse archive ordering; no second session identity or context store.
         newest = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-        if self._compression.compression_index > 0 and await self._archives.is_context_reset_archive(newest):
+        if (
+            self._compression.compression_index > 0
+            and await self._archives.is_context_reset_archive(newest)
+        ):
             return  # Context is already empty; no second boundary needed.
         self._compression.compression_index += 1
         archive_uri = (
@@ -2127,7 +2258,9 @@ class Session:
                             archive_uri,
                             {
                                 "completed_memory_steps": (
-                                    self._archives.serialize_completed_memory_steps(completed_memory_steps)
+                                    self._archives.serialize_completed_memory_steps(
+                                        completed_memory_steps
+                                    )
                                 )
                             },
                         )
@@ -2676,7 +2809,9 @@ class Session:
                     archive["archive_uri"],
                 )
 
-        merged_messages = self._archives.stable_deduplicate_messages(archive_messages + list(self._messages))
+        merged_messages = self._archives.stable_deduplicate_messages(
+            archive_messages + list(self._messages)
+        )
         merged_messages = await self._checkpoints.insert_terminal_checkpoints(
             merged_messages,
             terminal if terminal_state == "completed" else None,

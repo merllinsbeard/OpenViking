@@ -478,7 +478,11 @@ export function extractCaptureTurns(rolloutEntries, cfg = {}) {
 
     const shaped = shapeCapturePayload(payload, role, cfg, { toolNameById });
     if (shaped.dropped || (!shaped.text && shaped.parts.length === 0)) continue;
-    turns.push({ role, text: shaped.parts.length ? shaped.signalText : shaped.text, parts: shaped.parts });
+    const turn = { role, text: shaped.parts.length ? shaped.signalText : shaped.text, parts: shaped.parts };
+    for (const field of ["created_at", "turn_id", "message_kind", "source_message_ids", "origin"]) {
+      if (entry[field] != null) turn[field] = entry[field];
+    }
+    turns.push(turn);
   }
   return turns;
 }

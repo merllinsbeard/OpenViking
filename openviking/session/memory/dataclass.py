@@ -24,6 +24,7 @@ from typing import (
 
 from pydantic import BaseModel, Field, PrivateAttr, WithJsonSchema, model_validator
 
+from openviking.message.origin import OriginSelection
 from openviking.session.memory.merge_op.base import (
     FieldType,
     MergeOp,
@@ -168,6 +169,7 @@ class MemoryOperationSource(BaseModel):
     task_id: Optional[str] = None
     trace_id: Optional[str] = None
     extracted_at: Optional[str] = None
+    message_origins: Optional[OriginSelection] = None
 
 
 class MemoryOperationSkipCode(str, Enum):
@@ -347,6 +349,7 @@ class ResolvedOperation(BaseModel):
     source: Optional[MemoryOperationSource] = None
     sources: List[MemoryOperationSource] = Field(default_factory=list)
     source_ambiguous: bool = False
+    source_selection: Optional[OriginSelection] = Field(default=None, exclude=True)
     # Runtime-only resolution decision. It is deliberately excluded from model
     # serialization so it cannot enter later LLM merge prompts or memory files.
     resolution_skip: Optional[MemoryOperationSkip] = Field(default=None, exclude=True)

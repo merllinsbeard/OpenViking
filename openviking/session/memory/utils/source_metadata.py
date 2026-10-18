@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import json
-from typing import Any
+from dataclasses import asdict, dataclass
+from typing import Any, Literal
 
-from openviking.session.memory.dataclass import MemoryOperationSource, ResolvedOperation
+from openviking.message.origin import OriginConflict, SelectedMessage
+from openviking.session.memory.dataclass import MemoryFile, MemoryOperationSource, ResolvedOperation
 
 SYSTEM_SOURCE_FIELDS = frozenset(
     {
@@ -16,6 +18,129 @@ SYSTEM_SOURCE_FIELDS = frozenset(
         "last_update_trace_id",
     }
 )
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, default=asdict)
+
+
+@dataclass(frozen=True)
+class ExtractionOriginView:
+    source: MemoryOperationSource
+    messages: tuple[SelectedMessage, ...]
+
+
+@dataclass(frozen=True)
+class MemoryOriginView:
+    extractions: tuple[ExtractionOriginView, ...]
+    ambiguous: bool
+    conflicts: tuple[OriginConflict, ...]
+    exact_clause_proof: Literal[False] = False
+    semantic_withdrawal_established: Literal[False] = False
+
+
+def _origin_conflicts(sources: list[MemoryOperationSource]) -> tuple[OriginConflict, ...]:
+    by_id: dict[str, list[MemoryOperationSource]] = {}
+    for source in sources:
+        if source.extraction_id:
+            by_id.setdefault(source.extraction_id, []).append(source)
+    conflicts: dict[str, OriginConflict] = {}
+
+    def compare(extraction_id, message_id, field, values):
+        known = {_canonical(value): value for value in values if value is not None}
+        if len(known) > 1:
+            conflict = OriginConflict(
+                extraction_id=extraction_id,
+                message_id=message_id,
+                field=field,
+                variants=tuple(known[key] for key in sorted(known)),
+            )
+            conflicts[_canonical(conflict)] = conflict
+
+    for extraction_id, variants in by_id.items():
+        for field in MemoryOperationSource.model_fields:
+            if field != "message_origins":
+                compare(extraction_id, None, field, [getattr(source, field) for source in variants])
+        messages: dict[str, list] = {}
+        for source in variants:
+            if source.message_origins is not None:
+                for selected in source.message_origins.messages:
+                    messages.setdefault(selected.facts.message_id, []).append(selected.facts)
+        for message_id, facts in messages.items():
+            for field in ("legacy_created_at", "turn_id", "message_kind", "source_message_ids"):
+                compare(extraction_id, message_id, field, [getattr(fact, field) for fact in facts])
+            origins = [fact.origin for fact in facts if fact.origin is not None]
+            compare(extraction_id, message_id, "receiver", [origin.receiver for origin in origins])
+            contributors: dict[str, list] = {}
+            for origin in origins:
+                for contributor in origin.statements.contributors:
+                    for ref in contributor.refs:
+                        key = _canonical([contributor.locator, ref])
+                        group = contributors.setdefault(key, [])
+                        group.append(contributor)
+            for key, group in contributors.items():
+                for name in ("transport_sender", "primary_author"):
+                    claims = [
+                        getattr(item, name) for item in group if getattr(item, name) is not None
+                    ]
+                    for field in ("identifier", "scope"):
+                        compare(
+                            extraction_id,
+                            message_id,
+                            f"{key}.{name}.{field}",
+                            [getattr(claim.actor, field) for claim in claims],
+                        )
+                compare(
+                    extraction_id,
+                    message_id,
+                    f"{key}.content_class",
+                    [item.content_class for item in group if item.content_class != "unknown"],
+                )
+                times: dict[str, list] = {}
+                for item in group:
+                    for statement in item.times:
+                        times.setdefault(_canonical(statement.basis), []).append(statement)
+                for basis, statements in times.items():
+                    for field in ("literal", "encoding", "meaning"):
+                        compare(
+                            extraction_id,
+                            message_id,
+                            f"{key}.times.{basis}.{field}",
+                            [
+                                getattr(statement, field)
+                                for statement in statements
+                                if field != "meaning" or statement.meaning != "unknown"
+                            ],
+                        )
+    return tuple(conflicts[key] for key in sorted(conflicts))
+
+
+def memory_origin_view(memory: MemoryFile) -> MemoryOriginView:
+    sources = [
+        MemoryOperationSource.model_validate(value)
+        for value in memory.extra_fields.get("source_extractions", [])
+    ]
+    witnessed = {source.extraction_id for source in sources}
+    sources.extend(
+        MemoryOperationSource(extraction_id=value)
+        for value in sorted(extraction_ids(memory.extra_fields) - witnessed)
+    )
+    conflicts = _origin_conflicts(sources)
+    return MemoryOriginView(
+        extractions=tuple(
+            ExtractionOriginView(
+                source=source,
+                messages=source.message_origins.messages if source.message_origins else (),
+            )
+            for source in sources
+        ),
+        ambiguous=bool(
+            memory.extra_fields.get("source_provenance_ambiguous")
+            or memory.extra_fields.get("source_metadata_conflicts")
+            or conflicts
+        ),
+        conflicts=conflicts,
+    )
 
 
 def extraction_ids(fields: dict[str, Any]) -> set[str]:
@@ -43,7 +168,7 @@ def operation_source_metadata(
     if op.source is not None:
         sources.append(op.source)
     snapshots = {
-        json.dumps(source.model_dump(exclude_none=True), sort_keys=True): source
+        _canonical(source.model_dump(exclude_none=True)): source
         for source in sources
         if source.model_dump(exclude_none=True)
     }
@@ -51,23 +176,7 @@ def operation_source_metadata(
     ids = extraction_ids(old_fields) | extraction_ids(op.memory_fields)
     ids.update(source.extraction_id for source in sources if source.extraction_id)
     conflicts = set(old_fields.get("source_metadata_conflicts", []))
-    by_id: dict[str, list[MemoryOperationSource]] = {}
-    for source in sources:
-        if source.extraction_id:
-            by_id.setdefault(source.extraction_id, []).append(source)
-    for source_id, variants in by_id.items():
-        if any(
-            len(
-                {
-                    getattr(source, field)
-                    for source in variants
-                    if getattr(source, field) is not None
-                }
-            )
-            > 1
-            for field in MemoryOperationSource.model_fields
-        ):
-            conflicts.add(source_id)
+    conflicts.update(conflict.extraction_id for conflict in _origin_conflicts(sources))
 
     metadata: dict[str, Any] = {}
     if sources:
