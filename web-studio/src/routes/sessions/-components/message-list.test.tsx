@@ -3,7 +3,7 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { MessagePart } from '#/lib/sessions/types/message'
+import type { Message, MessagePart } from '#/lib/sessions/types/message'
 import { MessageList } from './message-list'
 
 vi.mock('react-i18next', () => ({
@@ -11,6 +11,26 @@ vi.mock('react-i18next', () => ({
 }))
 
 afterEach(cleanup)
+
+describe('MessageList timestamps', () => {
+  const roles: Message['role'][] = ['user', 'assistant']
+
+  it.each(roles)('omits unknown dates for %s messages', (role) => {
+    const message: Message = {
+      id: 'timestamp-message',
+      role,
+      parts: [{ type: 'text', text: 'Timestamp sample' }],
+      created_at: '2000-01-01T00:00:00Z',
+    }
+    const { container, rerender } = render(<MessageList messages={[message]} />)
+
+    expect(screen.getByText('chat.relativeTime.daysAgo')).toBeTruthy()
+
+    rerender(<MessageList messages={[{ ...message, created_at: null }]} />)
+
+    expect(container.textContent).toBe('Timestamp sample')
+  })
+})
 
 const toolParts: MessagePart[] = [
   {

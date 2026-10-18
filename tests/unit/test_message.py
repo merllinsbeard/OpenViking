@@ -349,7 +349,7 @@ class TestPartFromDict:
 
     def test_empty_dict(self):
         """Test empty dict creates empty TextPart."""
-        data = {}
+        data: dict[str, object] = {}
 
         part = part_from_dict(data)
 
@@ -371,7 +371,6 @@ class TestMessageInit:
         assert msg.id == "msg-123"
         assert msg.role == "user"
         assert len(msg.parts) == 1
-        # Note: created_at defaults to None; to_dict() generates timestamp if None
         assert msg.created_at is None
 
     def test_with_created_at(self):
@@ -734,6 +733,34 @@ class TestMessageFromDict:
         assert msg.parts[0].text == "Hello from legacy storage"
         assert msg.content == "Hello from legacy storage"
         assert msg.created_at is None
+
+    @pytest.mark.parametrize(
+        ("stored_time", "expected_time"),
+        [
+            ({}, None),
+            ({"created_at": None}, None),
+            (
+                {"created_at": "2026-10-17T09:10:11.123456+07:00"},
+                "2026-10-17T09:10:11.123456+07:00",
+            ),
+        ],
+    )
+    def test_legacy_timestamp_survives_repeated_jsonl_roundtrip(self, stored_time, expected_time):
+        msg = Message.from_dict(
+            {"id": "msg-legacy", "role": "user", "content": "Legacy words", **stored_time}
+        )
+        expected = {
+            "id": "msg-legacy",
+            "role": "user",
+            "parts": [{"type": "text", "text": "Legacy words"}],
+            "created_at": expected_time,
+        }
+
+        for _ in range(3):
+            row = json.loads(msg.to_jsonl())
+            assert row == expected
+            msg = Message.from_dict(row)
+            assert msg.created_at == expected_time
 
     def test_roundtrip(self):
         """Test to_dict -> from_dict roundtrip."""

@@ -8,7 +8,7 @@ Message = role + parts, supports serialization to JSONL.
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from openviking.core.peer_id import normalize_peer_id
 from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart, part_from_dict
@@ -23,7 +23,7 @@ class Message:
     role: Literal["user", "assistant"]
     parts: List[Part]
     peer_id: Optional[str] = None
-    created_at: str = None
+    created_at: Optional[str | datetime] = None
     turn_id: Optional[str] = None
     message_kind: Optional[
         Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
@@ -73,14 +73,14 @@ class Message:
 
     def to_dict(self) -> dict:
         """Serialize to JSONL."""
-        created_at_val = self.created_at or datetime.now(timezone.utc).isoformat()
+        created_at_val = self.created_at
         if isinstance(created_at_val, datetime):
             created_at_val = (
                 created_at_val.astimezone(timezone.utc)
                 .isoformat(timespec="milliseconds")
                 .replace("+00:00", "Z")
             )
-        data = {
+        data: dict[str, Any] = {
             "id": self.id,
             "role": self.role,
             "parts": [self._part_to_dict(p) for p in self.parts],
@@ -185,6 +185,7 @@ class Message:
         except ValueError:
             peer_id = data.get("peer_id")
 
+        source_message_ids = data.get("source_message_ids")
         return cls(
             id=data["id"],
             role=data["role"],
@@ -194,9 +195,7 @@ class Message:
             turn_id=data.get("turn_id"),
             message_kind=data.get("message_kind"),
             source_message_ids=(
-                list(data.get("source_message_ids"))
-                if isinstance(data.get("source_message_ids"), list)
-                else None
+                list(source_message_ids) if isinstance(source_message_ids, list) else None
             ),
         )
 

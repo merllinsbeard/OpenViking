@@ -71,8 +71,11 @@ export interface Message {
   id: string
   turn_id?: string
   message_kind?:
-    'user_query' | 'assistant_step' | 'tool_transport' | 'checkpoint'
+    | 'user_query'
+    | 'assistant_step'
+    | 'tool_transport'
+    | 'checkpoint'
   role: 'user' | 'assistant'
   parts: MessagePart[]
-  created_at: string
+  created_at: string | null
 }
