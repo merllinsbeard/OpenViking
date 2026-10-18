@@ -367,6 +367,11 @@ The plugin retains the existing `keep_recent_count: 0` commit behavior.
 The threshold is not a hard limit on extraction input: one turn can
 exceed it, and the server may include other context during extraction.
 
+Run guards in `$HERMES_HOME/openviking/runs/` remain empty files after release.
+Ownership is determined by the advisory lock, not file presence. Keeping the
+inode stable lets backup readers finish while sessions release locks; durable
+pending-session markers remain included in backups.
+
 ### Non-primary contexts
 
 When Hermes initializes the provider with `agent_context` set to `cron`, `subagent`,
