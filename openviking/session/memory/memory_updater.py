@@ -20,6 +20,7 @@ from openviking.core.context import ContextLevel
 from openviking.message import Message
 from openviking.message.origin import (
     ChunkSelection,
+    MessageFacts,
     OriginSelection,
     SelectedMessage,
     _message_facts,
@@ -572,7 +573,7 @@ class ExtractContext:
         view_ranges = tuple(
             (positions[id(group[0])], positions[id(group[-1])]) for group in groups if group
         )
-        facts_by_key = {}
+        facts_by_key: dict[str, MessageFacts] = {}
         chunks_by_key: dict[str, list[ChunkSelection]] = {}
         for group in groups:
             for message in group:
