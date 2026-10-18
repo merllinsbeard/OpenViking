@@ -236,11 +236,10 @@ function deduplicateCodexToolEvents(rolloutEntries) {
     const tool = completedToolEvent(entry);
     if (!tool?.id || !tool.name) continue;
     completedTools.set(entry, tool);
-    const sourceKey = `${tool.id}\0${tool.name}`;
-    const sources = completedSources.get(sourceKey) ?? [];
-    sources.push(entry);
-    completedSources.set(sourceKey, sources);
     const key = completedToolKey(tool);
+    const sources = completedSources.get(key) ?? [];
+    sources.push(entry);
+    completedSources.set(key, sources);
     const previous = preferredCompleted.get(key);
     if (!previous || completedToolPriority(entry) >= completedToolPriority(previous)) {
       preferredCompleted.set(key, entry);
@@ -249,8 +248,10 @@ function deduplicateCodexToolEvents(rolloutEntries) {
   const completedNamesById = new Map();
   for (const entry of preferredCompleted.values()) {
     const tool = completedTools.get(entry);
-    const names = completedNamesById.get(tool.id) ?? new Set();
-    names.add(tool.name);
+    const names = completedNamesById.get(tool.id) ?? new Map();
+    const keys = names.get(tool.name) ?? new Set();
+    keys.add(completedToolKey(tool));
+    names.set(tool.name, keys);
     completedNamesById.set(tool.id, names);
   }
   const responseNamesById = new Map();
@@ -270,15 +271,16 @@ function deduplicateCodexToolEvents(rolloutEntries) {
     const id = payload.call_id || payload.id;
     const names = completedNamesById.get(id);
     const name = payload.name || responseNamesById.get(id)
-      || (names?.size === 1 ? [...names][0] : undefined);
-    completedSources.get(`${id}\0${name}`)?.push(entry);
+      || (names?.size === 1 ? [...names.keys()][0] : undefined);
+    const keys = names?.get(name);
+    if (keys?.size === 1) completedSources.get([...keys][0]).push(entry);
   }
 
   return entries.flatMap((entry) => {
     const tool = completedTools.get(entry);
     if (tool?.id && tool.name) {
       return preferredCompleted.get(completedToolKey(tool)) === entry
-        ? [{ ...entry, ...mergeSourceFields(completedSources.get(`${tool.id}\0${tool.name}`)) }]
+        ? [{ ...entry, ...mergeSourceFields(completedSources.get(completedToolKey(tool))) }]
         : [];
     }
     const payload = entry?.payload;
