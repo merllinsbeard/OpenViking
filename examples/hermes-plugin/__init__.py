@@ -31,6 +31,7 @@ import zipfile
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -1365,6 +1366,30 @@ def _index_tool_calls(messages: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[st
     return tool_calls_by_id, completed_tool_ids, skipped_tool_ids
 
 
+def _source_message_metadata(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    metadata: List[Dict[str, Any]] = []
+    source_ids: List[str] = []
+    for message in messages:
+        supplied = {key: message.get(key) for key in ("created_at", "turn_id", "message_kind")}
+        timestamp = supplied["created_at"] or message.get("timestamp")
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            try:
+                timestamp = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                timestamp = None
+        supplied["created_at"] = timestamp if isinstance(timestamp, str) and timestamp else None
+        metadata.append(supplied)
+        for value in (message.get("source_message_ids"), [message.get("message_uid")],
+                      message.get("_absorbed_message_uids"), [message.get("platform_message_id")]):
+            if isinstance(value, list):
+                source_ids.extend(ref for ref in value if isinstance(ref, str) and ref)
+    shared = {key: value for key, value in metadata[0].items()
+              if isinstance(value, str) and value and all(m[key] == value for m in metadata)}
+    if source_ids:
+        shared["source_message_ids"] = list(dict.fromkeys(source_ids))
+    return shared
+
+
 @dataclass
 class _CommitScope:
     """One connection generation. Workers retain it across a config reload."""
@@ -2549,17 +2574,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
         tool_calls_by_id, completed_tool_ids, skipped_tool_ids = _index_tool_calls(dict_messages)
         payload_messages: List[Dict[str, Any]] = []
         pending_tool_parts: List[Dict[str, Any]] = []
+        pending_tool_sources: List[Dict[str, Any]] = []
+        tool_sources_by_id: Dict[str, Dict[str, Any]] = {}
 
-        def emit(role: str, parts: List[Dict[str, Any]]) -> None:
+        def emit(role: str, parts: List[Dict[str, Any]], sources: List[Dict[str, Any]]) -> None:
             peer_id = assistant_peer_id if role == "assistant" else user_peer_id if role == "user" else ""
             peer = {"peer_id": peer_id} if peer_id else {}
-            payload_messages.append({"role": role, "parts": parts, **peer})
+            payload_messages.append({"role": role, "parts": parts, **peer, **_source_message_metadata(sources)})
 
         def flush_tool_parts() -> None:
-            nonlocal pending_tool_parts
+            nonlocal pending_tool_parts, pending_tool_sources
             if pending_tool_parts:
-                emit("assistant", pending_tool_parts)
+                emit("assistant", pending_tool_parts, pending_tool_sources)
                 pending_tool_parts = []
+                pending_tool_sources = []
 
         for message in dict_messages:
             role = str(message.get("role") or "")
@@ -2570,6 +2598,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if tool_id not in skipped_tool_ids and not _is_openviking_recall_tool_name(tool_name):
                     pending_tool_parts.append(_tool_part(tool_id, tool_name, prior_call.get("tool_input", {}), _tool_result_status(message),
                                                          tool_output=_message_text(message.get("content"))))
+                    if tool_id in tool_sources_by_id:
+                        pending_tool_sources.append(tool_sources_by_id[tool_id])
+                    pending_tool_sources.append(message)
                 continue
             if role not in {"user", "assistant"}:
                 continue
@@ -2581,13 +2612,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     if not isinstance(tool_call, dict):
                         continue
                     tool_id, tool_name = _tool_call_id(tool_call), _tool_call_name(tool_call)
+                    if tool_id:
+                        tool_sources_by_id[tool_id] = message
                     if tool_id in skipped_tool_ids or tool_id in completed_tool_ids or _is_openviking_recall_tool_name(tool_name):
                         continue
                     # Pre-scan caches non-empty ids; parse again for the uncached empty-id case.
                     tool_input = tool_calls_by_id[tool_id]["tool_input"] if tool_id in tool_calls_by_id else _tool_call_input(tool_call)
                     parts.append(_tool_part(tool_id, tool_name, tool_input, "pending"))
+            else:
+                tool_sources_by_id.clear()
             if parts:
-                emit(role, parts)
+                emit(role, parts, [message])
 
         flush_tool_parts()
         return payload_messages
