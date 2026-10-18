@@ -52,7 +52,7 @@ def send(handler, result, *, delay=0, status=200, raw=False):
         pass
 
 
-def configure(external_provider, endpoint, **settings):
+def configure(external_provider, endpoint, *, manager_timeout=0.9, **settings):
     from agent.memory_manager import MemoryManager
 
     home, provider, module, _ = external_provider("deadline")
@@ -75,48 +75,45 @@ def configure(external_provider, endpoint, **settings):
         endpoint, "test-key", account="test", user="test", agent=""
     )
     provider._session_id = "deadline-session"
-    manager = MemoryManager(external_prefetch_timeout=0.9)
+    manager = MemoryManager(external_prefetch_timeout=manager_timeout)
     manager.add_provider(provider)
     return provider, module, manager
 
 
 def test_query_survives_startup_budget_exhaustion_and_next_turn_recovers(external_provider):
+    # Hold startup until the call returns: cancellation, rather than sub-second
+    # TLS/import timing, must preserve the already completed query result.
     paths = []
-    delay_query = [True]
+    startup_started, release_startup = threading.Event(), threading.Event()
 
     def respond(handler):
         paths.append(handler.path)
         if handler.path == "/api/v1/system/status":
-            send(handler, {"user": "test"}, delay=0.08)
+            send(handler, {"user": "test"})
         elif handler.path.startswith("/api/v1/content/read"):
-            send(handler, {"content": "Operator prefers source citations."}, delay=0.08)
+            startup_started.set()
+            release_startup.wait(5)
+            send(handler, {"content": "Operator prefers source citations."})
         elif handler.path.startswith("/api/v1/fs/ls"):
-            send(handler, [], delay=0.08)
+            send(handler, [])
         else:
-            send(
-                handler,
-                {
-                    "memories": [
-                        {
-                            "uri": "viking://user/test/memories/decision.md",
-                            "abstract": "Use the native source first.",
-                            "score": 0.9,
-                        }
-                    ]
-                },
-                delay=0.4 if delay_query[0] else 0,
-            )
+            send(handler, {"memories": [{"uri": "viking://user/test/memories/decision.md",
+                                        "abstract": "Use the native source first.", "score": 0.9}]})
 
     with recall_server(respond) as endpoint:
-        provider, _, manager = configure(external_provider, endpoint)
-        started = time.monotonic()
-        block = manager.prefetch_all("Which source should I use?", session_id="deadline-session")
-        elapsed = time.monotonic() - started
-        assert "Use the native source first." in block
-        assert "viking://user/test/memories/decision.md" in block
-        assert elapsed < 0.85
-        assert not manager._external_prefetch_threads
-        delay_query[0] = False
+        provider, _, manager = configure(external_provider, endpoint, manager_timeout=3.5,
+                                         recall_timeout_seconds=2.5, recall_request_timeout_seconds=2.3)
+        try:
+            started = time.monotonic()
+            block = manager.prefetch_all("Which source should I use?", session_id="deadline-session")
+            elapsed = time.monotonic() - started
+            assert startup_started.is_set()
+            assert "Use the native source first." in block
+            assert "viking://user/test/memories/decision.md" in block
+            assert elapsed < 3.5
+            assert not manager._external_prefetch_threads
+        finally:
+            release_startup.set()
         block = manager.prefetch_all("Which source should I use?", session_id="deadline-session")
         assert "Use the native source first." in block
         assert "viking://user/test/memories/decision.md" in block
