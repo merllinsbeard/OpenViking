@@ -97,15 +97,32 @@ def test_query_survives_startup_budget_exhaustion_and_next_turn_recovers(externa
         elif handler.path.startswith("/api/v1/fs/ls"):
             send(handler, [])
         else:
-            send(handler, {"memories": [{"uri": "viking://user/test/memories/decision.md",
-                                        "abstract": "Use the native source first.", "score": 0.9}]})
+            send(
+                handler,
+                {
+                    "memories": [
+                        {
+                            "uri": "viking://user/test/memories/decision.md",
+                            "abstract": "Use the native source first.",
+                            "score": 0.9,
+                        }
+                    ]
+                },
+            )
 
     with recall_server(respond) as endpoint:
-        provider, _, manager = configure(external_provider, endpoint, manager_timeout=3.5,
-                                         recall_timeout_seconds=2.5, recall_request_timeout_seconds=2.3)
+        provider, _, manager = configure(
+            external_provider,
+            endpoint,
+            manager_timeout=3.5,
+            recall_timeout_seconds=2.5,
+            recall_request_timeout_seconds=2.3,
+        )
         try:
             started = time.monotonic()
-            block = manager.prefetch_all("Which source should I use?", session_id="deadline-session")
+            block = manager.prefetch_all(
+                "Which source should I use?", session_id="deadline-session"
+            )
             elapsed = time.monotonic() - started
             assert startup_started.is_set()
             assert "Use the native source first." in block
