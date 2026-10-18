@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { expectExit, runHookScript, readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
+import { mockOriginReadback, expectExit, runHookScript, readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -105,8 +105,9 @@ test("auto-capture commits when pending tokens cross threshold", async () => {
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        calls[calls.length - 1].body = await readRequestBody(req);
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        calls[calls.length - 1].body = payload;
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-codex_commit") {
@@ -248,8 +249,9 @@ test("auto-capture sends every new turn when one response exceeds the old limit"
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        calls.push(await readRequestBody(req));
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        calls.push(payload);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-complete_trace") {
@@ -313,8 +315,8 @@ test("auto-capture logs a commit error trace_id", async () => {
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        await readRequestBody(req);
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-codex_error") {
@@ -400,8 +402,9 @@ test("auto-capture skips compacted history after transcript shrink", async () =>
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        batches.push(await readRequestBody(req));
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        batches.push(payload);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-compaction") {
@@ -487,8 +490,9 @@ test("auto-capture clears a stale session-end marker and never resets the cursor
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        batches.push(await readRequestBody(req));
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        batches.push(payload);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/v1/sessions/cx-resumed") {
@@ -555,8 +559,8 @@ test("a Stop clears only end markers older than the hook run", async () => {
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        await readRequestBody(req);
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname.startsWith("/api/v1/sessions/")) {
@@ -626,8 +630,8 @@ test("the workspace that decides capture is the payload's, not the hook process'
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        await readRequestBody(req);
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname.startsWith("/api/v1/sessions/")) {
@@ -685,7 +689,7 @@ test("failed capture resumes from the transcript once before committing", async 
         const body = await readRequestBody(req);
         if (healthy || body.messages?.length === 100) {
           delivered.push(...(body.messages || [body]));
-          writeJson(res, { status: "ok", result: {} });
+          writeJson(res, { status: "ok", result: mockOriginReadback(body.messages || [body]) });
           return;
         }
         res.writeHead(503, { "Content-Type": "application/json" });
@@ -725,7 +729,7 @@ test("failed capture resumes from the transcript once before committing", async 
         input: { source: "startup", session_id: "next", cwd: stateDir }, env,
       }));
       await runAutoCapture(input, env);
-      assert.deepEqual(delivered, messages);
+      assert.deepEqual(delivered.map(({ origin: _origin, ...message }) => message), messages);
       assert.equal(commits, 1);
       const recovered = JSON.parse(await readFile(statePath, "utf-8"));
       assert.equal(recovered.capturedTurnCount, 101);
@@ -770,8 +774,8 @@ test("a bypassed directory captures nothing and leaves no state behind", async (
         return;
       }
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        await readRequestBody(req);
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       if (req.method === "GET" && url.pathname.startsWith("/api/v1/sessions/")) {
@@ -826,8 +830,9 @@ test("capture filters rewrite and drop turns without stranding the cursor", asyn
     await withMockOpenViking(async (req, res) => {
       const url = new URL(req.url, "http://127.0.0.1");
       if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
-        batches.push(await readRequestBody(req));
-        writeJson(res, { status: "ok", result: { ok: true } });
+        const payload = await readRequestBody(req);
+        batches.push(payload);
+        writeJson(res, { status: "ok", result: mockOriginReadback(payload.messages) });
         return;
       }
       writeJson(res, { status: "ok", result: { ok: true } });

@@ -124,12 +124,32 @@ func (c *Client) AddMessage(ctx context.Context, sessionID, role string, opts Ad
 	if opts.SourceMessageIDs != nil {
 		payload["source_message_ids"] = opts.SourceMessageIDs
 	}
+	if opts.Origin != nil {
+		payload["origin"] = opts.Origin
+	}
+	if _, supplied := opts.Extra["origin"]; supplied {
+		return nil, fmt.Errorf("origin must use AddMessageOptions.Origin")
+	}
+	for _, key := range []string{"receiver", "session_ingest_started_at"} {
+		if _, supplied := opts.Extra[key]; supplied {
+			return nil, fmt.Errorf("receiver facts cannot be supplied by a producer")
+		}
+	}
 	setAny(payload, "telemetry", opts.Telemetry)
 	if err := mergeExtra(payload, opts.Extra); err != nil {
 		return nil, err
 	}
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/messages", nil, payload, &result)
+	if err != nil && opts.Origin != nil {
+		return nil, &OriginContractMismatch{Reason: err.Error()}
+	}
+	if err == nil {
+		err = validateOriginReadback([]Message{{Role: role, CreatedAt: opts.CreatedAt, TurnID: opts.TurnID, MessageKind: opts.MessageKind, SourceMessageIDs: opts.SourceMessageIDs, Parts: opts.Parts, Origin: opts.Origin}}, result)
+	}
+	if err != nil {
+		return nil, err
+	}
 	return result, err
 }
 
@@ -144,6 +164,18 @@ func (c *Client) BatchAddMessages(ctx context.Context, sessionID string, message
 	}
 	var result map[string]any
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/sessions/"+url.PathEscape(sessionID)+"/messages/batch", nil, payload, &result)
+	if err != nil {
+		for _, message := range messages {
+			if message.Origin != nil {
+				return nil, &OriginContractMismatch{Reason: err.Error()}
+			}
+		}
+	} else {
+		err = validateOriginReadback(messages, result)
+	}
+	if err != nil {
+		return nil, err
+	}
 	return result, err
 }
 

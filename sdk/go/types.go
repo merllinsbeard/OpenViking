@@ -417,21 +417,23 @@ type AddMessageOptions struct {
 	TurnID           string
 	MessageKind      string
 	SourceMessageIDs []string
+	Origin           *OriginStatements
 	Telemetry        any
 	Extra            map[string]any
 }
 
 // Message is one session message payload for BatchAddMessages.
 type Message struct {
-	Role             string           `json:"role"`
-	Content          *string          `json:"content,omitempty"`
-	Parts            []map[string]any `json:"parts,omitempty"`
-	CreatedAt        string           `json:"created_at,omitempty"`
-	PeerID           string           `json:"peer_id,omitempty"`
-	TurnID           string           `json:"turn_id,omitempty"`
-	MessageKind      string           `json:"message_kind,omitempty"`
-	SourceMessageIDs []string         `json:"source_message_ids,omitempty"`
-	Telemetry        any              `json:"telemetry,omitempty"`
+	Role             string            `json:"role"`
+	Content          *string           `json:"content,omitempty"`
+	Parts            []map[string]any  `json:"parts,omitempty"`
+	CreatedAt        string            `json:"created_at,omitempty"`
+	PeerID           string            `json:"peer_id,omitempty"`
+	TurnID           string            `json:"turn_id,omitempty"`
+	MessageKind      string            `json:"message_kind,omitempty"`
+	SourceMessageIDs []string          `json:"source_message_ids,omitempty"`
+	Origin           *OriginStatements `json:"origin,omitempty"`
+	Telemetry        any               `json:"telemetry,omitempty"`
 }
 
 // BatchAddMessagesOptions controls BatchAddMessages.

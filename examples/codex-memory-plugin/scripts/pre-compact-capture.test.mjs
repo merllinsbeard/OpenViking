@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
+import { mockOriginReadback, readRequestBody, withMockOpenViking, writeJson } from "../../memory-plugin-shared/testing/support.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -88,7 +88,7 @@ function mockHandler(calls) {
     }
     if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
       call.body = await readRequestBody(req);
-      writeJson(res, { status: "ok", result: { ok: true } });
+      writeJson(res, { status: "ok", result: mockOriginReadback(call.body.messages) });
       return;
     }
     if (req.method === "POST" && url.pathname.endsWith("/commit")) {

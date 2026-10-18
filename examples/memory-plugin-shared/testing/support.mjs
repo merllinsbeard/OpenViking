@@ -16,6 +16,31 @@ import { join } from "node:path";
 
 import { buildPluginConfig } from "../lib/plugin-config.mjs";
 
+/** MOCK server transport; sender validation itself remains native. */
+export function mockOriginReadback(messages) {
+  const stamp = "2026-10-17T00:00:00Z";
+  return {
+    origin_readback: "jsonl",
+    accepted_origins: messages.flatMap((message, inputIndex) => {
+      const parts = message.parts ?? [];
+      const count = message.role === "user" && parts.length > 1 && parts.every((part) => part.type === "tool") ? parts.length : 1;
+      return Array.from({ length: count }, (_, memberIndex) => ({
+        input_index: inputIndex, message_id: `mock-${inputIndex}-${memberIndex}`,
+        legacy_created_at: message.created_at || stamp, turn_id: message.turn_id ?? null,
+        message_kind: message.message_kind || (count > 1 ? "tool_transport" : null), source_message_ids: message.source_message_ids ?? null,
+        origin: {
+          ...(message.origin ?? { version: 1, contributors: [] }),
+          receiver: {
+            session_ingest_started_at: stamp,
+            applicability: count === 1 ? { kind: "input_message", group_id: `mock-group-${inputIndex}` }
+              : { kind: "input_group", group_id: `mock-group-${inputIndex}`, member_index: memberIndex, member_count: count },
+          },
+        },
+      }));
+    }),
+  };
+}
+
 /**
  * A built config resolved against nothing at all, for callers that only need
  * the shape of the object a loader receives.

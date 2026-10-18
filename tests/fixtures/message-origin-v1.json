@@ -1,0 +1,71 @@
+{
+  "message": {
+    "role": "user",
+    "content": "Synthetic forwarded text.",
+    "created_at": "2026-10-17T09:10:11.123456+07:00",
+    "turn_id": "turn-A",
+    "message_kind": "user_query",
+    "source_message_ids": ["record-A"],
+    "origin": {
+      "version": 1,
+      "contributors": [{
+        "locator": {"provider": "synthetic", "session_id": "session-A", "source_scope": null},
+        "refs": [{"kind": "provider_record", "value": "record-A"}],
+        "times": [{
+          "literal": "2026-10-17T09:10:11.123456+07:00",
+          "encoding": "rfc3339",
+          "meaning": "source_event",
+          "basis": {"producer": "synthetic", "field": "event.time"}
+        }],
+        "transport_sender": {
+          "actor": {"identifier": "sender-A", "scope": "chat-A"},
+          "basis": {"producer": "synthetic", "field": "event.sender"}
+        },
+        "primary_author": null,
+        "content_class": "unknown",
+        "class_basis": null
+      }]
+    }
+  },
+  "response": {
+    "status": "ok",
+    "result": {
+      "session_id": "native-v1",
+      "message_count": 1,
+      "pending_tokens": 4,
+      "origin_readback": "jsonl",
+      "accepted_origins": [{
+        "input_index": 0,
+        "message_id": "msg-A",
+        "legacy_created_at": "2026-10-17T09:10:11.123456+07:00",
+        "turn_id": "turn-A",
+        "message_kind": "user_query",
+        "source_message_ids": ["record-A"],
+        "origin": {
+          "version": 1,
+          "contributors": [{
+            "locator": {"provider": "synthetic", "session_id": "session-A", "source_scope": null},
+            "refs": [{"kind": "provider_record", "value": "record-A"}],
+            "times": [{
+              "literal": "2026-10-17T09:10:11.123456+07:00",
+              "encoding": "rfc3339",
+              "meaning": "source_event",
+              "basis": {"producer": "synthetic", "field": "event.time"}
+            }],
+            "transport_sender": {
+              "actor": {"identifier": "sender-A", "scope": "chat-A"},
+              "basis": {"producer": "synthetic", "field": "event.sender"}
+            },
+            "primary_author": null,
+            "content_class": "unknown",
+            "class_basis": null
+          }],
+          "receiver": {
+            "session_ingest_started_at": "2026-10-17T00:00:00Z",
+            "applicability": {"kind": "input_message", "group_id": "group-A"}
+          }
+        }
+      }]
+    }
+  }
+}
