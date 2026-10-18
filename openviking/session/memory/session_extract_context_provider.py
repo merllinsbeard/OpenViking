@@ -6,7 +6,9 @@ Session Extract Context Provider - 会话提取 Provider 实现
 从会话消息中提取记忆的实现。
 """
 
+import json
 import re
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.message.part import TextPart, ToolPart
@@ -242,9 +244,10 @@ When a memory item describes the current user, omit peer_id.
 When a memory item describes a peer, set peer_id to one of the peer_id values allowed by
 the output schema. Do not invent peer_id values.
 For memory items that carry a message-range field, the system derives self/peer targets from that range.
-Message role is authoritative for newly extracted facts: attribute each fact to the speaker whose
-message states it, and follow each enabled memory type's own schema rules for which role its content
-comes from. Do not infer ownership from neighboring messages.
+Message role controls interaction routing and each memory schema's role eligibility.
+Role and peer_id do not establish the primary author of the source text. Origin contributors are
+producer claims with their stated basis. Preserve unknown authorship for unmarked, forwarded,
+runtime, and relayed content. Do not infer an author from role, sender, timestamps, or nearby messages.
 Facts already stored in pre-fetched or explicitly read memories remain valid sources for
 maintenance and may be preserved, normalized, merged, split, or moved between enabled memory
 types when required by their schemas.
@@ -343,7 +346,33 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             if not body.strip():
                 return None
             speaker = msg.peer_id or msg.role
-            return f"[{idx}][{msg.role}][{speaker}]: {body}"
+            if msg.origin is None:
+                source: dict[str, Any] = {"scope": "unknown", "primary_author": "unknown"}
+            else:
+                source = {
+                    "scope": asdict(msg.origin.receiver.applicability),
+                    "session_ingest_started_at": msg.origin.receiver.session_ingest_started_at,
+                    "contributors": [
+                        {
+                            "content_class": contributor.content_class,
+                            "class_basis": asdict(contributor.class_basis)
+                            if contributor.class_basis
+                            else None,
+                            "times": [asdict(time) for time in contributor.times],
+                            "transport_sender": asdict(contributor.transport_sender)
+                            if contributor.transport_sender
+                            else None,
+                            "primary_author": asdict(contributor.primary_author)
+                            if contributor.primary_author
+                            else "unknown",
+                        }
+                        for contributor in msg.origin.statements.contributors
+                    ],
+                }
+                if not msg.origin.statements.contributors:
+                    source["primary_author"] = "unknown"
+            source_line = json.dumps(source, ensure_ascii=False, separators=(",", ":"))
+            return f"[{idx}][{msg.role}][{speaker}][source candidates={source_line}]: {body}"
 
         formatted_messages = [
             formatted

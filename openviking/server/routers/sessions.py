@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.peer_id import normalize_peer_id
 from openviking.core.uri_validation import validate_request_viking_uri
-from openviking.message.origin import OriginContractMismatch, OriginStatements, _accepted_origin
+from openviking.message.origin import (
+    OriginContractMismatch,
+    OriginStatements,
+    _accepted_origin,
+    _reject_receiver_facts,
+)
 from openviking.message.part import Part, TextPart, part_from_dict
 from openviking.server.auth import get_session_request_context
 from openviking.server.dependencies import get_service
@@ -152,11 +157,7 @@ class AddMessageRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def reject_receiver_facts(cls, value):
-        if isinstance(value, dict) and (
-            "receiver" in value or "session_ingest_started_at" in value
-        ):
-            raise ValueError("Receiver facts cannot be supplied by a producer")
-        return value
+        return _reject_receiver_facts(value)
 
     @field_validator("peer_id")
     @classmethod
@@ -175,6 +176,11 @@ class BatchAddMessageRequest(BaseModel):
 
     messages: List[AddMessageRequest] = Field(..., max_length=100)
     telemetry: TelemetryRequest = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_receiver_facts(cls, value):
+        return _reject_receiver_facts(value)
 
 
 class CreateSessionRequest(BaseModel):

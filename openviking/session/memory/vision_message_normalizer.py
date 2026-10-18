@@ -3,9 +3,10 @@
 """Normalize image messages into extraction-friendly text messages."""
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Dict, List
 
-from openviking.message import Message
+from openviking.message import Message, Part
 from openviking.message.part import ImagePart, TextPart
 
 IMAGE_DESCRIPTION_PROMPT = (
@@ -92,17 +93,9 @@ async def replace_image_parts_with_descriptions(
             vlm=get_vlm(),
             logger=logger,
         )
-        parts = _original_text_parts(message)
+        parts: List[Part] = list(_original_text_parts(message))
         if description:
             parts.append(TextPart(text=f"[Image description]: {description}"))
         if parts:
-            prepared_messages.append(
-                Message(
-                    id=message.id,
-                    role=message.role,
-                    parts=parts,
-                    peer_id=message.peer_id,
-                    created_at=message.created_at,
-                )
-            )
+            prepared_messages.append(replace(message, parts=parts))
     return prepared_messages

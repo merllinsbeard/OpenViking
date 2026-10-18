@@ -10,14 +10,20 @@ to the storage system.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 
 from openviking.core.context import ContextLevel
 from openviking.message import Message
+from openviking.message.origin import (
+    ChunkSelection,
+    OriginSelection,
+    SelectedMessage,
+    _message_facts,
+)
 from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
@@ -42,6 +48,7 @@ from openviking.session.memory.utils.resource_refs import (
 )
 from openviking.session.memory.utils.source_metadata import (
     SYSTEM_SOURCE_FIELDS,
+    _canonical,
     operation_source_metadata,
 )
 from openviking.session.memory.utils.template_utils import TemplateUtils
@@ -280,6 +287,7 @@ class ExtractContext:
                     if message.source_message_ids is not None
                     else None
                 ),
+                origin=message.origin,
             )
             chunk_messages.append(
                 (
@@ -548,6 +556,45 @@ class ExtractContext:
         if text.endswith(("。", ".", "！", "!", "？", "?")):
             return text
         return text + "。"
+
+    def select_message_origins(self, ranges: str | None = None) -> OriginSelection:
+        mode: Literal["selected_ranges", "extraction_batch_candidates"]
+        if ranges:
+            selected = self.read_message_ranges(ranges)
+            if not selected.elements:
+                raise ValueError("Message ranges select no extraction candidates")
+            mode = "selected_ranges"
+            groups = selected.elements
+        else:
+            mode = "extraction_batch_candidates"
+            groups = [self.messages]
+        positions = {id(message): index for index, message in enumerate(self.messages)}
+        view_ranges = tuple(
+            (positions[id(group[0])], positions[id(group[-1])]) for group in groups if group
+        )
+        facts_by_key = {}
+        chunks_by_key: dict[str, list[ChunkSelection]] = {}
+        for group in groups:
+            for message in group:
+                meta = self.chunk_meta.get(id(message))
+                facts = _message_facts(
+                    message, original_id=meta.source_message_id if meta is not None else message.id
+                )
+                key = _canonical(asdict(facts))
+                facts_by_key.setdefault(key, facts)
+                chunks = chunks_by_key.setdefault(key, [])
+                if meta is not None:
+                    chunk = ChunkSelection(index=meta.chunk_index, count=meta.chunk_count)
+                    if chunk not in chunks:
+                        chunks.append(chunk)
+        return OriginSelection(
+            mode=mode,
+            messages=tuple(
+                SelectedMessage(facts=facts, chunks=tuple(chunks_by_key[key]))
+                for key, facts in facts_by_key.items()
+            ),
+            view_ranges=view_ranges if ranges else (),
+        )
 
     def read_message_ranges(self, ranges_str: str) -> "MessageRange":
         """Parse ranges string like "0-10,50-60" or "7,9,11,13" and return combined MessageRange.

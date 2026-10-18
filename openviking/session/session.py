@@ -29,6 +29,7 @@ from openviking.message.origin import (
     WholeInputMessage,
     _message_facts,
     _parse_origin_input,
+    _reject_receiver_facts,
 )
 from openviking.message.part import ContextPart, ImagePart, TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
@@ -839,8 +840,7 @@ class Session:
         for index, value in enumerate(values):
             if not isinstance(value, dict) or "role" not in value or "parts" not in value:
                 raise ValueError(f"messages_spec[{index}]: role and parts are required")
-            if "receiver" in value or "session_ingest_started_at" in value:
-                raise ValueError("Receiver facts cannot be supplied by a producer")
+            _reject_receiver_facts(value)
             if value["role"] not in ("user", "assistant"):
                 raise ValueError(f"messages_spec[{index}]: invalid interaction role")
             parts = value["parts"]

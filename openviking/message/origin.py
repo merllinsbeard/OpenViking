@@ -163,11 +163,11 @@ class RecordedOrigin:
 @dataclass(frozen=True, config=_CONFIG)
 class MessageFacts:
     message_id: _Nonempty
-    origin: RecordedOrigin | None
-    legacy_created_at: StrictStr | None
-    turn_id: StrictStr | None
-    message_kind: StrictStr | None
-    source_message_ids: tuple[StrictStr, ...] | None
+    origin: RecordedOrigin | None = None
+    legacy_created_at: StrictStr | None = None
+    turn_id: StrictStr | None = None
+    message_kind: StrictStr | None = None
+    source_message_ids: tuple[StrictStr, ...] | None = None
 
     @property
     def origin_statements(self) -> OriginStatements:
@@ -209,6 +209,12 @@ class OriginConflict:
 
 class OriginContractMismatch(ValueError):
     """An append may have completed, but its origin receipt is unconfirmed."""
+
+
+def _reject_receiver_facts(value: object) -> object:
+    if isinstance(value, dict) and ("receiver" in value or "session_ingest_started_at" in value):
+        raise ValueError("Receiver facts cannot be supplied by a producer")
+    return value
 
 
 def _parse_origin_input(value: object) -> OriginStatements:

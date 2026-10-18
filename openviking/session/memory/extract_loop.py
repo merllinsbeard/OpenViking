@@ -906,6 +906,17 @@ class ExtractLoop:
                         extract_context=self._extract_context,
                     )
 
+                try:
+                    ranges = item_dict.get("ranges")
+                    resolved_op.source_selection = self._extract_context.select_message_origins(
+                        str(ranges) if ranges else None
+                    )
+                except ValueError:
+                    if resolved_op.resolution_skip is None:
+                        resolved_op.resolution_skip = MemoryOperationSkip(
+                            reason_code=MemoryOperationSkipCode.INVALID_RANGES,
+                            reason="Message ranges select no valid extraction candidates",
+                        )
                 upsert_operations.append(resolved_op)
 
         delete_replacements: dict[str, str] = {}

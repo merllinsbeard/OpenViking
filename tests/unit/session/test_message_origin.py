@@ -239,3 +239,15 @@ def test_http_request_type_rejects_receiver_injection(extra):
 
     with pytest.raises(ValueError):
         AddMessageRequest.model_validate({"role": "user", "content": "untrusted", **extra})
+
+
+@pytest.mark.parametrize(
+    "extra", [{"receiver": {}}, {"session_ingest_started_at": "1900-01-01T00:00:00Z"}]
+)
+def test_http_batch_root_rejects_receiver_injection(extra):
+    from openviking.server.routers.sessions import BatchAddMessageRequest
+
+    with pytest.raises(ValueError):
+        BatchAddMessageRequest.model_validate(
+            {"messages": [{"role": "user", "content": "untrusted"}], **extra}
+        )
