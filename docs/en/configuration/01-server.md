@@ -144,6 +144,9 @@ API-based `embedding`, `vlm`, `query_planner`, and `rerank` configurations reuse
 | `dimension` | integer, `> 0` | Vector dimension; must match model output and existing collections |
 | `input` | `"text"` / `"multimodal"` | Input type |
 | `encoding_format` | `"float"` / `"base64"` | OpenAI-compatible vector encoding |
+| `query_instruction` | string / `null`, default `null` | Literal query text prefix for `openai`, `azure`, and `ollama`; preserves case and whitespace |
+
+`query_instruction` is prepended once to query strings and each string in a query batch before `max_input_tokens` truncation. Include any separator in the prefix, for example `"Instruct: Retrieve relevant passages\nQuery: "`. Documents and content part lists received by the embedder are not prefixed. Existing input preparation can convert content parts to a string before calling the embedder; that string receives the prefix. This option changes query text only and does not change model metadata or require reindexing.
 
 Changing the model or `dimension` can make existing vector collections incompatible and may require migration or reindexing.
 
