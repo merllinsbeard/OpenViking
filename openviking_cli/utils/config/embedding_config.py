@@ -1113,6 +1113,7 @@ class EmbeddingConfig(BaseModel):
                 model=cred.model or config.model,
                 dimension=config.dimension,
                 batch_size=config.batch_size,
+                query_instruction=config.query_instruction,
                 query_param=config.query_param,
                 document_param=config.document_param,
                 provider=cred.provider or config.provider,
