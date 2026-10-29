@@ -433,7 +433,9 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
             raise RuntimeError(f"Embedding failed: {str(e)}") from e
 
     @model_error_boundary
-    async def embed_async(self, text: EmbeddingInput | List[str], is_query: bool = False) -> EmbedResult:
+    async def embed_async(
+        self, text: EmbeddingInput | List[str], is_query: bool = False
+    ) -> EmbedResult:
         client = self._get_async_client()
         embedding_input = self._prepare_embedding_input(text, is_query=is_query)
 
