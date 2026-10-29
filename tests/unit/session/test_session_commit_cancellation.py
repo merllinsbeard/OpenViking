@@ -81,7 +81,9 @@ async def test_child_cancellation_propagates_without_terminal_marker(
     with pytest.raises(asyncio.CancelledError):
         await session.resume_queued_commit(job)
 
-    assert (await tracker.get(job.task_id, account_id="default", user_id="default")).status is TaskStatus.RUNNING
+    task = await tracker.get(job.task_id, account_id="default", user_id="default")
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
     assert f"{job.archive_uri}/.failed.json" not in storage.files
     assert f"{job.archive_uri}/.done" not in storage.files
 
