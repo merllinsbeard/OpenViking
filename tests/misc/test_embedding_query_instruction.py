@@ -93,24 +93,25 @@ async def test_query_instruction_input_scope_and_budget(embeddings_endpoint, met
     )
     assert config.query_instruction is None
     config.query_instruction = prefix
-    text_embedder = EmbeddingConfig(dense=config, max_input_tokens=1).get_embedder()
+    text_embedder = EmbeddingConfig(dense=config, max_input_tokens=100).get_embedder()
     embedder = OpenAIDenseEmbedder(
         model_name="test-embedding",
         api_base=api_base,
         dimension=2,
         input_type="multimodal",
         query_instruction=prefix,
-        config={"max_input_tokens": 1},
+        config={"max_input_tokens": 100},
     )
     parts = [
         {"type": "text", "text": "xy"},
         {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
     ]
-    expected = "Q: x\n...(truncated for embedding)" if prefix else "xy"
+    query = "x" * 398
+    expected = "Q: " + "x" * 397 + "\n...(truncated for embedding)" if prefix else query
     try:
         for content, wire_input in [
-            ("xy", expected),
-            (["xy", "xy"], [expected, expected]),
+            (query, expected),
+            ([query, query], [expected, expected]),
             (parts, parts),
         ]:
             result = getattr(embedder, method)(content, is_query=True)
@@ -122,7 +123,7 @@ async def test_query_instruction_input_scope_and_budget(embeddings_endpoint, met
             await result
         assert requests[-1][1]["input"] == "xy"
         await embed_compat(text_embedder, [{"type": "text", "text": "xy"}], is_query=True)
-        assert requests[-1][1]["input"] == expected
+        assert requests[-1][1]["input"] == (prefix or "") + "xy"
     finally:
         await LoopScopedAsyncClientCache.close_current_loop_clients()
         embedder.close()
