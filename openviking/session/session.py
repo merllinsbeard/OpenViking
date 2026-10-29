@@ -2471,6 +2471,8 @@ class Session:
                         # same archive can resume without repeating them.
                         extraction_error: Optional[BaseException] = None
                         for label, result in zip(extraction_labels, _results, strict=True):
+                            if isinstance(result, asyncio.CancelledError):
+                                raise result
                             if isinstance(result, Exception):
                                 logger.error(
                                     "Phase 2 step %s failed: %s",
