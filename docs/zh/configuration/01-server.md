@@ -144,6 +144,9 @@ API 型 `embedding`、`vlm`、`query_planner` 和 `rerank` 配置会复用部分
 | `dimension` | integer，`> 0` | 向量维度，必须与模型输出及已有集合一致 |
 | `input` | `"text"` / `"multimodal"` | 输入类型 |
 | `encoding_format` | `"float"` / `"base64"` | OpenAI 兼容接口的向量编码格式 |
+| `query_instruction` | string / `null`，默认 `null` | `openai`、`azure` 和 `ollama` 的查询文本前缀，保留大小写和空白字符 |
+
+`query_instruction` 在 `max_input_tokens` 截断之前，为查询字符串及查询批次中的每个字符串添加一次前缀。分隔符需包含在前缀中，例如 `"Instruct: Retrieve relevant passages\nQuery: "`。文档和直接传入 Embedder 的内容片段列表不会添加前缀。现有的输入预处理可能在调用 Embedder 之前将内容片段转换为字符串，此时该字符串会添加前缀。此选项仅修改查询文本，不改变模型元数据，也无需重建索引。
 
 更换模型或 `dimension` 可能与已有向量集合不兼容，需要迁移或重建索引。
 

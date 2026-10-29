@@ -80,7 +80,6 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
         dimension: Optional[int] = None,
         query_param: Optional[str] = None,
         document_param: Optional[str] = None,
-        query_instruction: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         extra_headers: Optional[Dict[str, str]] = None,
         input_type: Optional[str] = None,
@@ -88,6 +87,7 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
         configured_provider: Optional[str] = None,
         encoding_format: Optional[Literal["float", "base64"]] = None,
         extra_body: Optional[Dict[str, Any]] = None,
+        query_instruction: Optional[str] = None,
     ):
         """Initialize OpenAI-Compatible Dense Embedder
 
@@ -124,6 +124,9 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
                        (e.g., OpenRouter provider routing:
                        {'provider': {'sort': 'latency'}}). Keys set explicitly via
                        query_param/document_param take precedence on conflict.
+            query_instruction: Literal prefix for query strings and each string in a text batch,
+                               applied before truncation. Content part lists are not prefixed here.
+                               Callers that first convert parts to a string receive the prefix.
 
         Raises:
             ValueError: If api_key is not provided and env vars are not set
@@ -323,7 +326,10 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
     def supports_multimodal(self) -> bool:
         return self._supports_multimodal
 
-    def _prepare_embedding_input(self, text: EmbeddingInput | List[str]) -> EmbeddingInput | List[str]:
+    def _prepare_embedding_input(
+        self, text: EmbeddingInput | List[str], is_query: bool = False
+    ) -> EmbeddingInput | List[str]:
+        text = self._apply_query_instruction(text, is_query)
         if isinstance(text, list) and all(isinstance(item, str) for item in text):
             if self.max_input_tokens is None:
                 return text
@@ -352,7 +358,6 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
     def _build_kwargs(
         self, text_input: EmbeddingInput | List[str], is_query: bool = False
     ) -> Dict[str, Any]:
-        text_input = self._apply_query_instruction(text_input, is_query)
         kwargs: Dict[str, Any] = {"input": text_input, "model": self.model_name}
         if self.dimension and self._should_send_dimensions():
             kwargs["dimensions"] = self.dimension
@@ -402,7 +407,7 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
         Raises:
             RuntimeError: When API call fails
         """
-        embedding_input = self._prepare_embedding_input(text)
+        embedding_input = self._prepare_embedding_input(text, is_query=is_query)
 
         def _call() -> EmbedResult:
             response = self.client.embeddings.create(
@@ -430,7 +435,7 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
     @model_error_boundary
     async def embed_async(self, text: EmbeddingInput | List[str], is_query: bool = False) -> EmbedResult:
         client = self._get_async_client()
-        embedding_input = self._prepare_embedding_input(text)
+        embedding_input = self._prepare_embedding_input(text, is_query=is_query)
 
         async def _call() -> EmbedResult:
             response = await client.embeddings.create(
