@@ -86,4 +86,3 @@ async def test_child_cancellation_propagates_without_terminal_marker(
     assert task.status is TaskStatus.RUNNING
     assert f"{job.archive_uri}/.failed.json" not in storage.files
     assert f"{job.archive_uri}/.done" not in storage.files
-
