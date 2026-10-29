@@ -57,7 +57,7 @@ def commit_run(monkeypatch):
         session_uri=session_uri,
         archive_uri=archive_uri,
         user={"account_id": "default", "user_id": "default"},
-        memory_policy={"memory_types": ["profile"]},
+        memory_policy={"memory_types": ["profile"], "working_memory": {"enabled": True}},
     )
     return session, storage, tracker, job
 
