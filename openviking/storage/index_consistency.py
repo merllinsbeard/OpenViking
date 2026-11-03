@@ -10,6 +10,7 @@ from typing import Any
 from openviking.core.context import ResourceContentType
 from openviking.core.namespace import is_session_uri
 from openviking.server.identity import RequestContext
+from openviking.server.user_config import is_user_config_control_uri
 from openviking.storage.expr import Eq
 from openviking.utils.embedding_utils import get_resource_content_type
 from openviking_cli.utils.logger import get_logger
@@ -139,7 +140,7 @@ def _file_candidates(
         if isinstance(size, int) and not isinstance(size, bool) and size == 0:
             continue
         uri = _entry_uri(root_uri, entry)
-        if not _is_index_scope(uri):
+        if not _is_index_scope(uri) or is_user_config_control_uri(uri):
             continue
         rel_path = str(entry.get("rel_path") or "")
         name = str(entry.get("name") or _leaf_name(rel_path))
