@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Optional, TypeVar
 
-from openviking.core.namespace import canonical_user_root
+from openviking.core.namespace import canonical_user_root, uri_parts
 from openviking.core.uri_validation import validate_content_target_uri
 from openviking.server.config import AddTargetsConfig, UserConfig
 from openviking.storage.acl import AclAction
@@ -28,14 +28,26 @@ class ResolvedAddTargets:
 
 
 _UpdateResult = TypeVar("_UpdateResult")
+_USER_CONFIG_FILES = ("user_config.json", "user_config.backup.json")
 
 
 def user_config_uri(ctx: RequestContext) -> str:
-    return f"{canonical_user_root(ctx)}/settings/user_config.json"
+    return f"{canonical_user_root(ctx)}/settings/{_USER_CONFIG_FILES[0]}"
 
 
 def user_config_backup_uri(ctx: RequestContext) -> str:
-    return f"{canonical_user_root(ctx)}/settings/user_config.backup.json"
+    return f"{canonical_user_root(ctx)}/settings/{_USER_CONFIG_FILES[1]}"
+
+
+def is_user_config_control_uri(uri: str) -> bool:
+    """Recognize user settings written directly without indexing."""
+    parts = uri_parts(uri)
+    return (
+        len(parts) == 4
+        and parts[0] == "user"
+        and parts[2] == "settings"
+        and parts[3] in _USER_CONFIG_FILES
+    )
 
 
 @asynccontextmanager
