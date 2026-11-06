@@ -1587,6 +1587,4 @@ async def test_unreadable_task_record_reads_as_missing_and_does_not_break_reconc
     tracker = TaskTracker(store=PersistentTaskStore(agfs))
 
     assert await tracker.get(task.task_id, **_owner_kwargs()) is None
-    await tracker.reconcile_delivery(
-        task.task_id, "work-1", "SessionCommit", **_owner_kwargs()
-    )
+    await tracker.reconcile_delivery(task.task_id, "work-1", "SessionCommit", **_owner_kwargs())
