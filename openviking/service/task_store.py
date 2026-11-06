@@ -43,6 +43,9 @@ from openviking.service.task_tracker_concurrency import (
     KeyedAsyncLockPool,
     run_to_completion,
 )
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 SYSTEM_TASK_ACCOUNT_ID = "_system"
 SYSTEM_TASK_USER_ID = "root"
