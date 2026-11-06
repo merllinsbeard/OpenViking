@@ -98,11 +98,72 @@ async def test_process_requeues_deferred_commit_and_resets_root_context(monkeypa
     )
     ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
 
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.session_commit_processor.asyncio.sleep", AsyncMock()
+    )
     result = await processor._process(_make_msg(), ctx)
 
     assert result is False
-    assert queued == [("SessionCommit", _make_msg().to_dict())]
+    expected = _make_msg().to_dict()
+    expected["dependency_wait_count"] = 1
+    assert queued == [("SessionCommit", expected)]
     assert get_root_observability_context() is None
+
+
+async def test_dependency_blocked_commit_waits_longer_each_time_up_to_a_cap(monkeypatch):
+    queued: list = []
+    slept: list = []
+
+    class _QueueManager:
+        async def enqueue(self, queue_name, data):
+            queued.append(data)
+
+    async def _record_sleep(delay):
+        slept.append(delay)
+
+    processor = SessionCommitProcessor(
+        SimpleNamespace(session=Mock(return_value=_FakeSession({}, processed=False))),
+    )
+    monkeypatch.setattr("openviking.storage.queuefs.get_queue_manager", lambda: _QueueManager())
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.session_commit_processor.asyncio.sleep", _record_sleep
+    )
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+    msg = _make_msg()
+    for _ in range(14):
+        await processor._process(msg, ctx)
+        msg = SessionCommitMsg.from_dict(queued[-1])
+
+    assert [item["dependency_wait_count"] for item in queued] == list(range(1, 15))
+    assert slept[0] > 0
+    assert slept == sorted(slept)
+    assert slept[-1] == slept[-2] == SessionCommitProcessor._DEPENDENCY_WAIT_MAX_DELAY
+
+
+async def test_waiting_message_from_an_older_producer_starts_at_the_base_delay(monkeypatch):
+    slept: list = []
+
+    async def _record_sleep(delay):
+        slept.append(delay)
+
+    processor = SessionCommitProcessor(
+        SimpleNamespace(session=Mock(return_value=_FakeSession({}, processed=False))),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: SimpleNamespace(enqueue=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.session_commit_processor.asyncio.sleep", _record_sleep
+    )
+    legacy = _make_msg().to_dict()
+    legacy.pop("dependency_wait_count")
+    ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+    await processor._process(SessionCommitMsg.from_dict(legacy), ctx)
+
+    assert slept == [SessionCommitProcessor._DEPENDENCY_WAIT_BASE_DELAY]
 
 
 async def test_cancelled_queued_commit_writes_terminal_marker_before_returning():

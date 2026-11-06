@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Queue consumer for restart-safe Session Phase 2 work."""
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -23,6 +24,15 @@ if TYPE_CHECKING:
 
 
 class SessionCommitProcessor(DequeueHandlerBase):
+    # A commit blocked behind an earlier archive of its session goes back on the
+    # queue. Without a pause that is a hot loop (#4345): the same messages cycle
+    # as fast as the consumer turns while the predecessor's Phase 2 runs for
+    # minutes. The pause happens before the delivery is acknowledged, so a
+    # restart mid-wait redelivers the message instead of losing it.
+    _DEPENDENCY_WAIT_BASE_DELAY = 0.05
+    _DEPENDENCY_WAIT_MAX_DELAY = 10.0
+    _DEPENDENCY_WAIT_MAX_DOUBLING = 8
+
     def __init__(
         self,
         session_service: "SessionService",
@@ -79,13 +89,20 @@ class SessionCommitProcessor(DequeueHandlerBase):
             if not processed:
                 from openviking.storage.queuefs import QueueManager, get_queue_manager
 
-                await get_queue_manager().enqueue(
-                    QueueManager.SESSION_COMMIT,
-                    msg.to_dict(),
-                )
+                await asyncio.sleep(self._dependency_wait_delay(msg.dependency_wait_count))
+                payload = msg.to_dict()
+                payload["dependency_wait_count"] = msg.dependency_wait_count + 1
+                await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, payload)
             return processed
         finally:
             reset_root_observability_context(root_context_token)
+
+    @classmethod
+    def _dependency_wait_delay(cls, wait_count: int) -> float:
+        doublings = min(max(wait_count, 0), cls._DEPENDENCY_WAIT_MAX_DOUBLING)
+        return min(
+            cls._DEPENDENCY_WAIT_BASE_DELAY * (2**doublings), cls._DEPENDENCY_WAIT_MAX_DELAY
+        )
 
     async def _finalize_cancelled(self, msg: SessionCommitMsg, ctx: RequestContext) -> None:
         session = self._session_service.session(
